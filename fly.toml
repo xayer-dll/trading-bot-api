@@ -1,0 +1,16 @@
+app = "trading-bot-api"
+primary_region = "fra"   # Frankfurt — Türkiye'ye en yakın
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https   = true
+  auto_stop_machines  = false   # Asla uyuma!
+  auto_start_machines = true
+  min_machines_running = 1      # Her zaman en az 1 makine çalışsın
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1

@@ -258,6 +258,12 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
 
+@app.get("/health")
+def health():
+    """Keep-alive endpoint — Render'in uyumasini onler."""
+    return {"ok": True, "running": state["running"]}
+
+
 @app.get("/status")
 def get_status():
     # Aktif çiftin verilerini üst seviyeye taşı (dashboard uyumluluğu)
