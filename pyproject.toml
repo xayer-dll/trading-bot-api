@@ -9,6 +9,7 @@ dependencies = [
     "fastapi>=0.136.3",
     "numpy>=2.4.6",
     "pandas>=3.0.3",
+    "py-clob-client>=0.17.0",
     "python-binance>=1.0.36",
     "ta>=0.11.0",
     "uvicorn>=0.48.0",

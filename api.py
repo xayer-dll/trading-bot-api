@@ -287,8 +287,11 @@ def _process_pair(client, symbol: str):
             if gain >= state["take_profit_pct"]:
                 _handle_sell(client, symbol, pair, price, rsi, "TAKE-PROFIT")
 
-        # RSI sinyali
-        signal = get_signal(rsi, price)
+        # RSI sinyali (state'deki dinamik esikleri kullan)
+        signal = get_signal(rsi, price,
+                            oversold=state["rsi_oversold"],
+                            overbought=state["rsi_overbought"],
+                            symbol=symbol)
         pos    = get_position()
 
         if signal == SIGNAL_BUY and not pos["active"]:

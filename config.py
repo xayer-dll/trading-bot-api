@@ -23,17 +23,20 @@ CANDLE_LIMIT    = 100
 LOOP_INTERVAL   = 10        # Her kaç saniyede bir kontrol? (10-300 arası)
 
 # Takip edilecek ciftler (multi-pair)
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
+SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT",
+    "BNBUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
+]
 
-# RSI
+# RSI — agresif ayarlar (daha sik islem)
 RSI_PERIOD      = 14
-RSI_OVERSOLD    = 30
-RSI_OVERBOUGHT  = 70
+RSI_OVERSOLD    = 35        # 30→35: daha erken al
+RSI_OVERBOUGHT  = 65        # 70→65: daha erken sat
 
-# Risk yönetimi
+# Risk yonetimi
 TRADE_AMOUNT    = 10.0
-STOP_LOSS_PCT   = 0.02       # %2
-TAKE_PROFIT_PCT = 0.03       # %3
+STOP_LOSS_PCT   = 0.015      # %1.5 (daha siki koruma)
+TAKE_PROFIT_PCT = 0.025      # %2.5 (daha hizli kar al)
 TRAILING_STOP   = False      # Trailing stop-loss aktif mi?
 
 # ─── TELEGRAM BİLDİRİMLERİ ──────────────────────────────────────────────────
