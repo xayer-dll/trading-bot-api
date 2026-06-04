@@ -1,4 +1,4 @@
-app = "trading-bot-api"
+app = "furkan"
 primary_region = "fra"   # Frankfurt -- Turkiye'ye en yakin
 
 [build]

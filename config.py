@@ -22,8 +22,8 @@ TIMEFRAME       = "1m"
 CANDLE_LIMIT    = 100
 LOOP_INTERVAL   = 10        # Her kaç saniyede bir kontrol? (10-300 arası)
 
-# Takip edilecek çiftler (multi-pair)
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+# Takip edilecek ciftler (multi-pair)
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
 
 # RSI
 RSI_PERIOD      = 14

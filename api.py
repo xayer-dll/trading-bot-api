@@ -53,7 +53,7 @@ state = {
     "running":          False,
     "balance_usdt":     0.0,
     "active_symbol":    config.SYMBOLS[0],
-    "active_symbols":   config.SYMBOLS[:1],   # Başlangıçta sadece 1. çift
+    "active_symbols":   list(config.SYMBOLS),   # Tum ciftler aktif: BTC, ETH, SOL
     "pairs":            {s: _default_pair() for s in config.SYMBOLS},
     "equity_history":   [],
     "iteration":        0,
