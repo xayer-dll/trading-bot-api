@@ -95,24 +95,58 @@ class PolymarketClient:
 
     async def get_market_price(self, market_id: str) -> Optional[Dict]:
         """
-        Piyasa YES fiyatını al.
-        YES fiyatı yüksek = pazar YES tarafını fark ediyor
+        Piyasa YES/NO fiyatlarını al.
+
+        Kaynaklar (priority sırasında):
+        1. outcomePrices: [NO_price, YES_price]
+        2. bestBid/bestAsk: son alış-satış
+        3. lastTradePrice: son işlem fiyatı
+        4. Fallback: 0.5 (neutral)
         """
         try:
-            async with self.session.get(
-                f"{POLYMARKET_CLOB}/prices",
-                params={"market_id": market_id}
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("prices"):
-                        return {
-                            "yes_price": float(data["prices"][0]),  # YES tarafı
-                            "no_price": float(data["prices"][1]),   # NO tarafı
-                            "timestamp": datetime.now().isoformat()
-                        }
+            market = await self.get_market(market_id)
+            if not market:
+                return None
+
+            # Method 1: outcomePrices
+            prices = market.get("outcomePrices")
+            if prices and len(prices) >= 2:
+                try:
+                    return {
+                        "yes_price": float(prices[1]),
+                        "no_price": float(prices[0]),
+                        "source": "outcomePrices",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                except (ValueError, IndexError):
+                    pass
+
+            # Method 2: bestBid/bestAsk (YES tarafı)
+            best_ask = market.get("bestAsk")
+            best_bid = market.get("bestBid")
+            if best_ask and best_bid:
+                try:
+                    yes_price = (float(best_ask) + float(best_bid)) / 2
+                    return {
+                        "yes_price": yes_price,
+                        "no_price": 1 - yes_price,
+                        "source": "bestBid/Ask",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                except (ValueError, TypeError):
+                    pass
+
+            # Method 3: Fallback - neutral
+            logger.warning(f"[POLY] Fiyat verisi eksik ({market_id}) - neutral used")
+            return {
+                "yes_price": 0.5,
+                "no_price": 0.5,
+                "source": "fallback",
+                "timestamp": datetime.now().isoformat()
+            }
+
         except Exception as e:
-            logger.error(f"[POLY] Fiyat hatası: {e}")
+            logger.error(f"[POLY] Fiyat hatası ({market_id}): {e}")
         return None
 
 
@@ -144,26 +178,51 @@ class PolymarketBot:
 
     async def find_crypto_prediction_markets(self) -> List[Dict]:
         """Kripto ile ilgili tahmin pazarlarını bul."""
-        keywords = ["bitcoin", "ethereum", "crypto", "btc", "eth", "price", "bull", "bear"]
+        # Kesin kripto keywords
+        crypto_keywords = ["bitcoin", "ethereum", "btc", "eth", "crypto", "altcoin", "defi", "nft", "dogecoin", "doge", "solana", "sol", "binance", "coinbase"]
+
         all_markets = await self.client.get_markets()
 
         crypto_markets = []
         for market in all_markets:
-            title = market.get("title", "").lower()
             question = market.get("question", "").lower()
+            description = market.get("description", "").lower()
 
-            if any(kw in title or kw in question for kw in keywords):
+            # question + description içinde kripto keyword ara
+            full_text = f"{question} {description}"
+
+            # Kesin match: word boundary tarafından cevrilmeli
+            # Örn: "ethereum" word, "ether" değil
+            found = False
+            for kw in crypto_keywords:
+                if f" {kw} " in f" {full_text} " or full_text.startswith(kw) or full_text.endswith(kw):
+                    found = True
+                    break
+
+            if found:
+                # Likidite numeric string olabilir, dönüştür
+                try:
+                    liquidity = float(market.get("liquidity", 0))
+                except (ValueError, TypeError):
+                    liquidity = 0
+
+                try:
+                    volume = float(market.get("volume", 0))
+                except (ValueError, TypeError):
+                    volume = 0
+
                 crypto_markets.append({
                     "id": market.get("id"),
-                    "title": market.get("title"),
-                    "question": market.get("question"),
-                    "volume": market.get("volume", 0),
-                    "liquidity": market.get("liquidity", 0)
+                    "question": market.get("question"),  # API 'question' kullanıyor
+                    "volume": volume,
+                    "liquidity": liquidity,
+                    "active": market.get("active", False),
+                    "endDate": market.get("endDate", ""),
                 })
 
-        # Likidite sırasına göre sırala
+        # Likidite sırasına göre sırala (yüksek → düşük)
         crypto_markets.sort(key=lambda x: x.get("liquidity", 0), reverse=True)
-        return crypto_markets[:10]  # Top 10
+        return crypto_markets[:15]  # Top 15
 
     async def execute_trade(
         self,

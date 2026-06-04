@@ -629,6 +629,7 @@ name = "trading-bot"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "colorama" },
     { name = "fastapi" },
     { name = "numpy" },
@@ -641,6 +642,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.11.0" },
     { name = "colorama", specifier = ">=0.4.6" },
     { name = "fastapi", specifier = ">=0.136.3" },
     { name = "numpy", specifier = ">=2.4.6" },
