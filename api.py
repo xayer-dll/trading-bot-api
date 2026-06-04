@@ -33,6 +33,8 @@ from notifications import (notify_start, notify_stop, notify_buy,
                             notify_sell, notify_stop_loss, notify_take_profit, notify_error)
 from backtest import run_backtest
 import futures as fut
+from polymarket import PolymarketBot, PolymarketClient
+from news_analyzer import NewsAnalyzer
 
 # ─── GLOBAL DURUM ────────────────────────────────────────────────────────────
 def _default_pair():
@@ -71,12 +73,116 @@ state = {
     # Futures (aktifse)
     "futures_position":  {"active": False},
     "funding_rate":      0.0,
+
+    # Polymarket tahmin pazarları
+    "polymarket_enabled": True,
+    "polymarket_markets": [],
+    "polymarket_positions": {},
+
+    # Haber sentiment analizi
+    "news_sentiment": 0.5,  # -1 to +1 (0.5 = neutral)
+    "news_headlines": [],
+    "news_last_update": None,
 }
 
 stop_event = threading.Event()
 bot_thread = None
 active_ws: List[WebSocket] = []
 _pair_executors = {}   # symbol → {"_position": ...} (executor state izolasyonu)
+polymarket_bot: Optional[PolymarketBot] = None
+news_analyzer: Optional[NewsAnalyzer] = None
+
+
+# ─── POLYMARKET YARDIMCILARı ────────────────────────────────────────────────────
+async def _init_polymarket():
+    """Polymarket bot'u başlat."""
+    global polymarket_bot
+    try:
+        polymarket_bot = PolymarketBot()
+        await polymarket_bot.initialize()
+
+        # Crypto pazarlarını bul ve cache'le
+        markets = await polymarket_bot.find_crypto_prediction_markets()
+        state["polymarket_markets"] = [
+            {
+                "id": m.get("id"),
+                "title": m.get("title"),
+                "volume": m.get("volume"),
+                "liquidity": m.get("liquidity")
+            }
+            for m in markets
+        ]
+        print(f"[POLY] {len(state['polymarket_markets'])} tahmin pazarı bulundu")
+        return True
+    except Exception as e:
+        print(f"[POLY HATA] Başlama hatası: {e}")
+        state["polymarket_enabled"] = False
+        return False
+
+
+async def _update_news_sentiment():
+    """Haber sentiment'ini güncelle (her 5 dakika)."""
+    global news_analyzer
+    if not news_analyzer:
+        return
+
+    try:
+        sentiment_data = await news_analyzer.get_latest_sentiment(hours=24)
+
+        # Sentiment skoru normalize et (-1 to +1)
+        # very_bullish: +0.9, bullish: +0.6, neutral: 0, bearish: -0.6, very_bearish: -0.9
+        sentiment_map = {
+            "very_bullish": 0.9,
+            "bullish": 0.6,
+            "neutral": 0.0,
+            "bearish": -0.6,
+            "very_bearish": -0.9,
+        }
+
+        sentiment_score = sentiment_map.get(sentiment_data["sentiment"], 0.0)
+        state["news_sentiment"] = sentiment_score
+        state["news_headlines"] = sentiment_data.get("top_headlines", [])
+        state["news_last_update"] = datetime.now().strftime("%H:%M:%S")
+
+        print(
+            f"[NEWS] Sentiment: {sentiment_data['sentiment']} "
+            f"({sentiment_data['count']} haber, "
+            f"{sentiment_data['bullish_count']} bullish, "
+            f"{sentiment_data['bearish_count']} bearish)"
+        )
+    except Exception as e:
+        print(f"[NEWS] Update hatası: {e}")
+
+
+async def _process_polymarket_signal(symbol: str, rsi: float, signal: str):
+    """RSI + Haber Sentiment ile Polymarket'e işlem yap."""
+    if not polymarket_bot or not state["polymarket_markets"]:
+        return
+
+    try:
+        # İlk crypto pazarına işlem yap
+        if state["polymarket_markets"]:
+            market = state["polymarket_markets"][0]
+            market_id = market.get("id")
+
+            # Haber sentiment'ini ekle
+            result = await polymarket_bot.execute_trade(
+                market_id=market_id,
+                rsi=rsi,
+                symbol=symbol,
+                news_sentiment=state["news_sentiment"]  # -1 to +1
+            )
+
+            if result.get("success"):
+                print(
+                    f"[POLY] {symbol} | RSI={rsi:.1f} + News={state['news_sentiment']:+.2f} "
+                    f"→ {result['side']} ({result['final_confidence']:.0%})"
+                )
+                state["polymarket_positions"][market_id] = result
+            else:
+                print(f"[POLY] Hata: {result.get('error', 'Bilinmeyen')}")
+    except Exception as e:
+        print(f"[POLY] İşlem hatası: {e}")
 
 
 # ─── YARDIMCILAR ─────────────────────────────────────────────────────────────
@@ -203,7 +309,32 @@ def _process_pair(client, symbol: str):
 
 # ─── BOT DÖNGÜSÜ ─────────────────────────────────────────────────────────────
 def bot_loop():
+    global polymarket_bot, news_analyzer
     client = get_client()
+
+    # Async event loop kur
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Haber Analyzer başlat
+    try:
+        news_analyzer = NewsAnalyzer()
+        # Başlangıçta haber sentiment'ini güncelle
+        try:
+            loop.run_until_complete(news_analyzer.__aenter__())
+            loop.run_until_complete(_update_news_sentiment())
+        except Exception as e:
+            print(f"[NEWS HATA] {e}")
+    except Exception as e:
+        print(f"[NEWS] Başlatılamadı: {e}")
+
+    # Polymarket başlat (async yapılacak)
+    if state["polymarket_enabled"]:
+        try:
+            loop.run_until_complete(_init_polymarket())
+        except Exception as e:
+            print(f"[POLY HATA] Başlatılamadı: {e}")
+            state["polymarket_enabled"] = False
 
     # İlk yükleme
     try:
@@ -226,6 +357,13 @@ def bot_loop():
 
         for symbol in list(state["active_symbols"]):
             _process_pair(client, symbol)
+
+        # Haber sentiment'ini 5 dakikada bir güncelle
+        if state["iteration"] % 300 == 0:  # 300 saniyede bir
+            try:
+                loop.run_until_complete(_update_news_sentiment())
+            except Exception as e:
+                print(f"[NEWS] Döngü update hatası: {e}")
 
         # Futures pozisyon güncelle
         if state["futures_enabled"]:
@@ -250,6 +388,14 @@ def bot_loop():
 
     state["running"] = False
     notify_stop()
+
+    # Polymarket'i kapat
+    if polymarket_bot:
+        try:
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(polymarket_bot.shutdown())
+        except Exception as e:
+            print(f"[POLY] Kapanış hatası: {e}")
 
 
 # ─── FASTAPI ─────────────────────────────────────────────────────────────────
@@ -297,6 +443,74 @@ def set_symbol(symbol: str):
     if symbol in state["pairs"]:
         state["active_symbol"] = symbol
     return {"ok": True, "active_symbol": state["active_symbol"]}
+
+
+# ─── POLYMARKET ENDPOİNTLERİ ───────────────────────────────────────────────────
+
+@app.get("/polymarket/markets")
+def get_polymarket_markets():
+    """Bulunan crypto tahmin pazarlarını listele."""
+    return {
+        "enabled": state["polymarket_enabled"],
+        "markets": state["polymarket_markets"],
+        "count": len(state["polymarket_markets"])
+    }
+
+
+@app.get("/polymarket/positions")
+def get_polymarket_positions():
+    """Aktif Polymarket pozisyonlarını göster."""
+    return {
+        "positions": state["polymarket_positions"],
+        "count": len(state["polymarket_positions"])
+    }
+
+
+@app.get("/polymarket/status")
+def get_polymarket_status():
+    """Polymarket bot durumunu göster."""
+    return {
+        "enabled": state["polymarket_enabled"],
+        "bot_initialized": polymarket_bot is not None,
+        "markets_found": len(state["polymarket_markets"]),
+        "active_positions": len(state["polymarket_positions"])
+    }
+
+
+# ─── HABER SENTIMENT ENDPOİNTLERİ ────────────────────────────────────────────
+
+@app.get("/news/sentiment")
+def get_news_sentiment():
+    """Genel kripto haber sentiment'ini göster."""
+    # Score'u label'a çevir
+    score = state["news_sentiment"]
+    if score >= 0.65:
+        sentiment_label = "very_bullish"
+    elif score >= 0.55:
+        sentiment_label = "bullish"
+    elif score <= 0.35:
+        sentiment_label = "very_bearish"
+    elif score <= 0.45:
+        sentiment_label = "bearish"
+    else:
+        sentiment_label = "neutral"
+
+    return {
+        "sentiment": sentiment_label,
+        "score": round(state["news_sentiment"], 2),  # -1 to +1
+        "headlines": state["news_headlines"],
+        "last_update": state["news_last_update"],
+    }
+
+
+@app.get("/news/headlines")
+def get_news_headlines():
+    """Top haberler listesi."""
+    return {
+        "headlines": state["news_headlines"],
+        "count": len(state["news_headlines"]),
+        "updated": state["news_last_update"],
+    }
 
 
 @app.post("/symbols/add")
