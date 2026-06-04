@@ -22,5 +22,7 @@ services:
         sync: false
       - key: TELEGRAM_ENABLED
         value: "true"
+      - key: AUTO_START
+        value: "true"
       - key: PYTHON_VERSION
         value: "3.11.0"

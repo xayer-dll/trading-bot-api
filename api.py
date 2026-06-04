@@ -716,6 +716,23 @@ async def ws_endpoint(websocket: WebSocket):
             active_ws.remove(websocket)
 
 
+# ─── OTOMATIK BASLAT ────────────────────────────────────────────────────────
+# Sunucu acilinca bot otomatik calissin.
+# AUTO_START=true env variable ile kontrol edilir.
+# Fly.io / Render'da her zaman true olacak.
+
+@app.on_event("startup")
+async def on_startup():
+    """Sunucu acilinca bot'u otomatik baslat."""
+    auto = os.environ.get("AUTO_START", "false").lower()
+    if auto == "true":
+        print("[AUTO-START] Bot otomatik baslatiliyor...")
+        start_bot()
+    else:
+        print("[READY] Bot hazir — /start ile baslatabilirsin")
+        print("[TIP]   Otomatik baslatmak icin: AUTO_START=true")
+
+
 if __name__ == "__main__":
     print("[OK] API: http://localhost:8000  |  Dashboard: http://localhost:3000")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")

@@ -1,0 +1,10 @@
+__pycache__/
+*.py[oc]
+.venv/
+.env
+.env.local
+logs/
+*.log
+*.db
+.git/
+.claude/

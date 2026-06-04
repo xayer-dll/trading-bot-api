@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Sistem bağımlılıkları
+# Sistem bagimliliklari
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     && rm -rf /var/lib/apt/lists/*
@@ -10,15 +10,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # uv kur
 RUN pip install uv
 
-# Bağımlılıkları kur (cache için önce sadece pyproject.toml kopyala)
+# Bagimliliklari kur (cache icin once sadece pyproject.toml kopyala)
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
-# Kaynak kodları kopyala
+# Kaynak kodlari kopyala
 COPY . .
+
+# SQLite verisi icin dizin
+RUN mkdir -p /data
+ENV DB_PATH=/data/trading_bot.db
+
+# Log dizini
+RUN mkdir -p /app/logs
 
 # Port
 EXPOSE 8080
 
-# Başlat
+# Baslat
 CMD ["uv", "run", "uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8080"]
