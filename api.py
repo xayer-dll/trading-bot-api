@@ -35,6 +35,8 @@ from backtest import run_backtest
 import futures as fut
 from polymarket import PolymarketBot, PolymarketClient
 from news_analyzer import NewsAnalyzer
+from snowball import SnowballEngine
+from database import init_db, save_trade, save_stats, save_equity, load_trades, load_stats, load_equity, get_db_summary
 
 # ─── GLOBAL DURUM ────────────────────────────────────────────────────────────
 def _default_pair():
@@ -91,6 +93,10 @@ active_ws: List[WebSocket] = []
 _pair_executors = {}   # symbol → {"_position": ...} (executor state izolasyonu)
 polymarket_bot: Optional[PolymarketBot] = None
 news_analyzer: Optional[NewsAnalyzer] = None
+snowball: Optional[SnowballEngine] = None
+
+# SQLite veritabanini baslat
+init_db()
 
 
 # ─── POLYMARKET YARDIMCILARı ────────────────────────────────────────────────────
@@ -218,8 +224,47 @@ def _update_stats(pair_state: dict, pnl: float):
 
 
 # ─── ÇIFT İŞLEMCİSİ ──────────────────────────────────────────────────────────
+def _handle_sell(client, symbol: str, pair: dict, price: float, rsi: float, reason: str):
+    """Ortak satis islemi: snowball + db + bildirim."""
+    pos = get_position()
+    entry_p = pos["entry_price"]
+    qty = pos["quantity"]
+
+    if sell(client, symbol=symbol, reason=reason):
+        pnl = round((price - entry_p) * qty, 4)
+        _update_stats(pair, pnl)
+
+        # SNOWBALL: Kazanci/kayibi kaydet → sonraki islem miktarini ayarla
+        if snowball:
+            snowball.record_trade(pnl, symbol)
+            state["trade_amount"] = snowball.calculate_trade_amount()
+
+        # DATABASE: Islemi kaydet
+        save_trade(symbol, "SELL", price, rsi, pnl=pnl, reason=reason)
+        save_stats(symbol, pair["stats"])
+
+        pair["trades"].insert(0, {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "action": "SELL", "price": price, "rsi": round(rsi, 2),
+            "pnl": pnl, "reason": reason})
+        pair["_watching"] = False
+
+        # Bildirimler
+        if reason == "STOP-LOSS":
+            drop = (entry_p - price) / entry_p
+            notify_stop_loss(symbol, price, drop * 100)
+        elif reason == "TAKE-PROFIT":
+            gain = (price - entry_p) / entry_p
+            notify_take_profit(symbol, price, gain * 100)
+        else:
+            notify_sell(symbol, price, rsi, pnl, reason)
+
+        return True
+    return False
+
+
 def _process_pair(client, symbol: str):
-    """Tek bir çifti işler. Her döngüde tüm semboller için çağrılır."""
+    """Tek bir cifti isler. Her dongude tum semboller icin cagrilir."""
     pair = state["pairs"][symbol]
 
     try:
@@ -228,60 +273,41 @@ def _process_pair(client, symbol: str):
         rsi   = float(df["rsi"].iloc[-2]) if not pd.isna(df["rsi"].iloc[-2]) else 50.0
         price = float(df["close"].iloc[-2])
 
-        # Stop-loss
+        # Stop-loss kontrolu
         pos = get_position()
         if pos["active"] and pair.get("_watching", False):
             drop = (pos["entry_price"] - price) / pos["entry_price"]
             if drop >= state["stop_loss_pct"]:
-                sell(client, symbol=symbol, reason="STOP-LOSS")
-                pnl = round((price - pos["entry_price"]) * pos["quantity"], 4)
-                _update_stats(pair, pnl)
-                notify_stop_loss(symbol, price, drop * 100)
-                pair["trades"].insert(0, {
-                    "time": datetime.now().strftime("%H:%M:%S"),
-                    "action": "SELL", "price": price, "rsi": round(rsi, 2),
-                    "pnl": pnl, "reason": "STOP-LOSS"})
-                pair["_watching"] = False
+                _handle_sell(client, symbol, pair, price, rsi, "STOP-LOSS")
 
-        # Take-profit
+        # Take-profit kontrolu
         pos = get_position()
         if pos["active"] and pair.get("_watching", False):
             gain = (price - pos["entry_price"]) / pos["entry_price"]
             if gain >= state["take_profit_pct"]:
-                sell(client, symbol=symbol, reason="TAKE-PROFIT")
-                pnl = round((price - pos["entry_price"]) * pos["quantity"], 4)
-                _update_stats(pair, pnl)
-                notify_take_profit(symbol, price, gain * 100)
-                pair["trades"].insert(0, {
-                    "time": datetime.now().strftime("%H:%M:%S"),
-                    "action": "SELL", "price": price, "rsi": round(rsi, 2),
-                    "pnl": pnl, "reason": "TAKE-PROFIT"})
-                pair["_watching"] = False
+                _handle_sell(client, symbol, pair, price, rsi, "TAKE-PROFIT")
 
         # RSI sinyali
         signal = get_signal(rsi, price)
         pos    = get_position()
 
         if signal == SIGNAL_BUY and not pos["active"]:
-            if buy(client, symbol=symbol, usdt_amount=state["trade_amount"]):
+            # SNOWBALL: Dinamik islem miktari
+            trade_amt = state["trade_amount"]
+
+            if buy(client, symbol=symbol, usdt_amount=trade_amt):
                 pair["trades"].insert(0, {
                     "time": datetime.now().strftime("%H:%M:%S"),
                     "action": "BUY", "price": price, "rsi": round(rsi, 2), "pnl": None})
                 pair["_watching"] = True
-                notify_buy(symbol, price, rsi, state["trade_amount"])
+
+                # DATABASE: Alim islemini kaydet
+                save_trade(symbol, "BUY", price, rsi)
+
+                notify_buy(symbol, price, rsi, trade_amt)
 
         elif signal == SIGNAL_SELL and pos["active"]:
-            entry_p = pos["entry_price"]
-            qty     = pos["quantity"]
-            if sell(client, symbol=symbol, reason="RSI-SELL"):
-                pnl = round((price - entry_p) * qty, 4)
-                _update_stats(pair, pnl)
-                pair["trades"].insert(0, {
-                    "time": datetime.now().strftime("%H:%M:%S"),
-                    "action": "SELL", "price": price, "rsi": round(rsi, 2),
-                    "pnl": pnl, "reason": "RSI-SELL"})
-                pair["_watching"] = False
-                notify_sell(symbol, price, rsi, pnl, "RSI-SELL")
+            _handle_sell(client, symbol, pair, price, rsi, "RSI-SELL")
 
         pair["trades"] = pair["trades"][:50]
 
@@ -294,7 +320,7 @@ def _process_pair(client, symbol: str):
         if new_hist: new_hist[-1]["signal"] = signal
         pair["price_history"] = new_hist
 
-        # Pair state güncelle
+        # Pair state guncelle
         pair.update({
             "price": price, "rsi": round(rsi, 2), "signal": signal,
             "position": {**pos, "pnl": pnl},
@@ -309,36 +335,51 @@ def _process_pair(client, symbol: str):
 
 # ─── BOT DÖNGÜSÜ ─────────────────────────────────────────────────────────────
 def bot_loop():
-    global polymarket_bot, news_analyzer
+    global polymarket_bot, news_analyzer, snowball
     client = get_client()
 
     # Async event loop kur
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # Haber Analyzer başlat
+    # SNOWBALL: Kartopu motorunu baslat
+    try:
+        _update_balance(client)
+        snowball = SnowballEngine(initial_balance=state["balance_usdt"])
+        state["trade_amount"] = snowball.calculate_trade_amount()
+        print(f"[SNOWBALL] Baslangic bakiye: ${state['balance_usdt']:.2f}")
+        print(f"[SNOWBALL] Ilk islem miktari: ${state['trade_amount']:.2f}")
+
+        # Onceki istatistikleri DB'den yukle
+        for sym in config.SYMBOLS:
+            db_stats = load_stats(sym)
+            if db_stats and db_stats["total_trades"] > 0:
+                state["pairs"][sym]["stats"] = db_stats
+                print(f"[DB] {sym} istatistikleri yuklendi: {db_stats['total_trades']} islem")
+    except Exception as e:
+        print(f"[SNOWBALL/DB HATA] {e}")
+
+    # Haber Analyzer baslat
     try:
         news_analyzer = NewsAnalyzer()
-        # Başlangıçta haber sentiment'ini güncelle
         try:
             loop.run_until_complete(news_analyzer.__aenter__())
             loop.run_until_complete(_update_news_sentiment())
         except Exception as e:
             print(f"[NEWS HATA] {e}")
     except Exception as e:
-        print(f"[NEWS] Başlatılamadı: {e}")
+        print(f"[NEWS] Baslatilamadi: {e}")
 
-    # Polymarket başlat (async yapılacak)
+    # Polymarket baslat
     if state["polymarket_enabled"]:
         try:
             loop.run_until_complete(_init_polymarket())
         except Exception as e:
-            print(f"[POLY HATA] Başlatılamadı: {e}")
+            print(f"[POLY HATA] Baslatilamadi: {e}")
             state["polymarket_enabled"] = False
 
-    # İlk yükleme
+    # Ilk yukleme
     try:
-        _update_balance(client)
         for s in state["active_symbols"]:
             df = get_ohlcv(client, symbol=s)
             df = add_rsi(df, period=state["rsi_period"])
@@ -347,7 +388,7 @@ def bot_loop():
             "t": datetime.now().strftime("%H:%M"),
             "balance": state["balance_usdt"]})
     except Exception as e:
-        print(f"[Başlangıç HATA] {e}")
+        print(f"[Baslangic HATA] {e}")
 
     notify_start(state["active_symbols"])
 
@@ -376,10 +417,16 @@ def bot_loop():
             except Exception:
                 pass
 
+        # Bakiye gecmisi + DB kaydi
         state["equity_history"].append({
             "t": datetime.now().strftime("%H:%M"),
             "balance": state["balance_usdt"]})
         state["equity_history"] = state["equity_history"][-200:]
+        save_equity(state["balance_usdt"])
+
+        # SNOWBALL: Gercek bakiyeyi sync et
+        if snowball:
+            snowball.sync_balance(state["balance_usdt"])
 
         # Ayarlanabilir bekleme süresi (1'er saniyelik adımlarla kontrol eder)
         for _ in range(state["loop_interval"]):
@@ -511,6 +558,34 @@ def get_news_headlines():
         "count": len(state["news_headlines"]),
         "updated": state["news_last_update"],
     }
+
+
+# ─── SNOWBALL ENDPOINTLERi ──────────────────────────────────────────────────
+
+@app.get("/snowball")
+def get_snowball_stats():
+    """Kartopu motoru istatistikleri."""
+    if not snowball:
+        return {"enabled": False, "message": "Bot henuz baslamadi"}
+    return {"enabled": True, **snowball.get_stats()}
+
+
+@app.get("/db/summary")
+def get_database_summary():
+    """Veritabani ozet istatistikleri."""
+    return get_db_summary()
+
+
+@app.get("/db/trades")
+def get_database_trades(symbol: Optional[str] = None, limit: int = 50):
+    """Veritabanindan islem gecmisi."""
+    return {"trades": load_trades(symbol=symbol, limit=limit)}
+
+
+@app.get("/db/equity")
+def get_database_equity(limit: int = 120):
+    """Veritabanindan bakiye gecmisi."""
+    return {"equity": load_equity(limit=limit)}
 
 
 @app.post("/symbols/add")
