@@ -734,5 +734,6 @@ async def on_startup():
 
 
 if __name__ == "__main__":
-    print("[OK] API: http://localhost:8000  |  Dashboard: http://localhost:3000")
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
+    port = int(os.environ.get("PORT", 8080))
+    print(f"[OK] API: http://localhost:{port}  |  Dashboard: http://localhost:3000")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
