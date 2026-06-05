@@ -225,18 +225,23 @@ def _update_stats(pair_state: dict, pnl: float):
 
 # ─── ÇIFT İŞLEMCİSİ ──────────────────────────────────────────────────────────
 def _handle_sell(client, symbol: str, pair: dict, price: float, rsi: float, reason: str):
-    """Ortak satis islemi: snowball + db + bildirim."""
+    """Ortak satis islemi: snowball + kaldirac + db + bildirim."""
     pos = get_position(symbol)
     entry_p = pos["entry_price"]
     qty = pos["quantity"]
 
     if sell(client, symbol=symbol, reason=reason):
-        pnl = round((price - entry_p) * qty, 4)
+        # KALDIRACLI PnL: spot pnl × kaldirac
+        spot_pnl = round((price - entry_p) * qty, 4)
+        leverage = state.get("leverage", 1)
+        pnl = round(spot_pnl * leverage, 4)
+
         _update_stats(pair, pnl)
 
-        # SNOWBALL: Kazanci/kayibi kaydet → sonraki islem miktarini ayarla
+        # SNOWBALL: Kaldiracli PnL kaydet
+        margin_used = state.get("trade_amount", 10)
         if snowball:
-            snowball.record_trade(pnl, symbol)
+            snowball.record_trade(pnl, symbol, margin_used=margin_used)
             state["trade_amount"] = snowball.calculate_trade_amount()
 
         # DATABASE: Islemi kaydet
@@ -314,9 +319,10 @@ def _process_pair(client, symbol: str):
 
         pair["trades"] = pair["trades"][:50]
 
-        # Pozisyon PnL
+        # Pozisyon PnL (kaldiracli)
         pos  = get_position(symbol)
-        pnl  = round((price - pos["entry_price"]) * pos["quantity"], 4) if pos["active"] else 0.0
+        leverage = state.get("leverage", 1)
+        pnl  = round((price - pos["entry_price"]) * pos["quantity"] * leverage, 4) if pos["active"] else 0.0
 
         # Price history
         new_hist = _build_history(df)
@@ -348,7 +354,7 @@ def bot_loop():
     # SNOWBALL: Kartopu motorunu baslat
     try:
         _update_balance(client)
-        snowball = SnowballEngine(initial_balance=state["balance_usdt"])
+        snowball = SnowballEngine(initial_balance=state["balance_usdt"], leverage=state["leverage"])
         state["trade_amount"] = snowball.calculate_trade_amount()
         print(f"[SNOWBALL] Baslangic bakiye: ${state['balance_usdt']:.2f}")
         print(f"[SNOWBALL] Ilk islem miktari: ${state['trade_amount']:.2f}")
