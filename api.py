@@ -37,6 +37,8 @@ from polymarket import PolymarketBot, PolymarketClient
 from news_analyzer import NewsAnalyzer
 from snowball import SnowballEngine
 from database import init_db, save_trade, save_stats, save_equity, load_trades, load_stats, load_equity, get_db_summary
+from auditor import TradeAuditor
+from learner import TradeLearner
 
 # ─── GLOBAL DURUM ────────────────────────────────────────────────────────────
 def _default_pair():
@@ -94,6 +96,8 @@ _pair_executors = {}   # symbol → {"_position": ...} (executor state izolasyon
 polymarket_bot: Optional[PolymarketBot] = None
 news_analyzer: Optional[NewsAnalyzer] = None
 snowball: Optional[SnowballEngine] = None
+auditor: Optional[TradeAuditor] = None
+learner: Optional[TradeLearner] = None
 
 # SQLite veritabanini baslat
 init_db()
@@ -225,13 +229,13 @@ def _update_stats(pair_state: dict, pnl: float):
 
 # ─── ÇIFT İŞLEMCİSİ ──────────────────────────────────────────────────────────
 def _handle_sell(client, symbol: str, pair: dict, price: float, rsi: float, reason: str):
-    """Ortak satis islemi: snowball + kaldirac + db + bildirim."""
+    """Ortak satis islemi: snowball + kaldirac + denetim + ogrenme + db + bildirim."""
     pos = get_position(symbol)
     entry_p = pos["entry_price"]
     qty = pos["quantity"]
 
     if sell(client, symbol=symbol, reason=reason):
-        # KALDIRACLI PnL: spot pnl × kaldirac
+        # KALDIRACLI PnL: spot pnl x kaldirac
         spot_pnl = round((price - entry_p) * qty, 4)
         leverage = state.get("leverage", 1)
         pnl = round(spot_pnl * leverage, 4)
@@ -243,6 +247,44 @@ def _handle_sell(client, symbol: str, pair: dict, price: float, rsi: float, reas
         if snowball:
             snowball.record_trade(pnl, symbol, margin_used=margin_used)
             state["trade_amount"] = snowball.calculate_trade_amount()
+
+        # AUDITOR: Islemi denetle (her 5 islemde otomatik tarama)
+        if auditor:
+            audit_result = auditor.add_trade({
+                "symbol": symbol,
+                "action": "SELL",
+                "entry_price": entry_p,
+                "exit_price": price,
+                "quantity": qty,
+                "pnl": pnl,
+                "margin": margin_used,
+                "reason": reason,
+                "timestamp": datetime.now().isoformat(),
+            })
+            if audit_result and audit_result.get("issues"):
+                print(f"[AUDIT] {symbol} ANOMALI: {len(audit_result['issues'])} sorun!")
+                for issue in audit_result.get("issues", []):
+                    if isinstance(issue, dict):
+                        print(f"  [!] {issue.get('message', str(issue))}")
+                    else:
+                        print(f"  [!] {issue}")
+
+        # LEARNER: Islemden ders cikar
+        if learner:
+            macd_data = pair.get("macd", {})
+            learner.record_trade({
+                "symbol": symbol,
+                "action": "SELL",
+                "entry_price": entry_p,
+                "exit_price": price,
+                "pnl": pnl,
+                "rsi_at_entry": pair.get("_entry_rsi", 50),
+                "rsi_at_exit": rsi,
+                "macd_bullish": macd_data.get("bullish"),
+                "signal_type": pair.get("_entry_signal", "BUY"),
+                "reason": reason,
+                "timestamp": datetime.now().isoformat(),
+            })
 
         # DATABASE: Islemi kaydet
         save_trade(symbol, "SELL", price, rsi, pnl=pnl, reason=reason)
@@ -317,13 +359,27 @@ def _process_pair(client, symbol: str):
             if signal == SIGNAL_STRONG_BUY:
                 trade_amt = round(trade_amt * 1.5, 2)
 
-            if buy(client, symbol=symbol, usdt_amount=trade_amt):
+            # LEARNER: Bu coinde islem yapmali mi?
+            if learner and not learner.should_trade(symbol):
+                pass  # Ogrenme motoru bu coini onaylamamis — atla
+            elif buy(client, symbol=symbol, usdt_amount=trade_amt):
                 pair["trades"].insert(0, {
                     "time": datetime.now().strftime("%H:%M:%S"),
                     "action": "BUY", "price": price, "rsi": round(rsi, 2), "pnl": None})
                 pair["_watching"] = True
+                pair["_entry_rsi"] = round(rsi, 2)      # Learner icin giris RSI
+                pair["_entry_signal"] = signal            # Learner icin sinyal tipi
 
-                # DATABASE: Alim islemini kaydet
+                # AUDITOR: Alim islemini kaydet
+                if auditor:
+                    auditor.add_trade({
+                        "symbol": symbol, "action": "BUY",
+                        "entry_price": price, "exit_price": 0,
+                        "quantity": 0, "pnl": None,
+                        "timestamp": datetime.now().isoformat(),
+                    })
+
+                # DATABASE
                 save_trade(symbol, "BUY", price, rsi)
 
                 notify_buy(symbol, price, rsi, trade_amt)
@@ -365,10 +421,14 @@ def bot_loop():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # SNOWBALL: Kartopu motorunu baslat
+    # SNOWBALL + AUDITOR + LEARNER baslat
     try:
         _update_balance(client)
         snowball = SnowballEngine(initial_balance=state["balance_usdt"], leverage=state["leverage"])
+        auditor = TradeAuditor(leverage=state["leverage"])
+        learner = TradeLearner()
+        print("[AUDIT] Denetim motoru aktif — her 5 islemde otomatik tarama")
+        print("[LEARNER] Ogrenme motoru aktif — islemlerden ders cikaracak")
         state["trade_amount"] = snowball.calculate_trade_amount()
         print(f"[SNOWBALL] Baslangic bakiye: ${state['balance_usdt']:.2f}")
         print(f"[SNOWBALL] Ilk islem miktari: ${state['trade_amount']:.2f}")
@@ -607,6 +667,22 @@ def get_indicators(symbol: str):
         "macd": pair.get("macd", {}),
         "bollinger": pair.get("bollinger", {}),
     }
+
+
+@app.get("/audit")
+def get_audit_status():
+    """Denetim motoru durumu."""
+    if not auditor:
+        return {"enabled": False}
+    return {"enabled": True, **auditor.get_status()}
+
+
+@app.get("/learner")
+def get_learner_status():
+    """Ogrenme motoru durumu ve oneriler."""
+    if not learner:
+        return {"enabled": False}
+    return {"enabled": True, **learner.get_recommendations()}
 
 
 @app.get("/db/summary")
