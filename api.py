@@ -414,7 +414,7 @@ def _process_pair(client, symbol: str):
 
 # ─── BOT DÖNGÜSÜ ─────────────────────────────────────────────────────────────
 def bot_loop():
-    global polymarket_bot, news_analyzer, snowball
+    global polymarket_bot, news_analyzer, snowball, auditor, learner
     client = get_client()
 
     # Async event loop kur
