@@ -20,8 +20,9 @@ if os.environ.get("TELEGRAM_CHAT_ID"):_cfg.TELEGRAM_CHAT_ID= os.environ["TELEGRA
 if os.environ.get("TELEGRAM_ENABLED"):_cfg.TELEGRAM_ENABLED= os.environ["TELEGRAM_ENABLED"].lower() == "true"
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 import config
 from connection import get_client
@@ -667,6 +668,72 @@ def get_indicators(symbol: str):
         "macd": pair.get("macd", {}),
         "bollinger": pair.get("bollinger", {}),
     }
+
+
+# ─── TRADINGVIEW WEBHOOK ─────────────────────────────────────────────────────
+# TradingView'da alarm olustur → Webhook URL: https://furkan.fly.dev/webhook/tradingview
+# Mesaj formati (JSON):
+#   {"symbol": "BTCUSDT", "action": "BUY", "price": 62000, "source": "tradingview"}
+#   {"symbol": "BTCUSDT", "action": "SELL", "price": 63000, "source": "tradingview"}
+
+class WebhookSignal(BaseModel):
+    symbol: str = "BTCUSDT"
+    action: str = "BUY"       # BUY veya SELL
+    price: float = 0
+    source: str = "tradingview"
+    message: str = ""
+
+
+@app.post("/webhook/tradingview")
+async def tradingview_webhook(signal: WebhookSignal):
+    """
+    TradingView alarm webhook'u.
+
+    TradingView'da:
+    1. Grafik ac → Alarm ekle
+    2. Bildirimler → Webhook URL: https://furkan.fly.dev/webhook/tradingview
+    3. Mesaj:
+       {"symbol": "BTCUSDT", "action": "BUY", "price": {{close}}, "source": "tradingview"}
+    """
+    print(f"[TRADINGVIEW] Sinyal geldi: {signal.action} {signal.symbol} @ ${signal.price}")
+
+    if not state["running"]:
+        return {"ok": False, "error": "Bot calismyor"}
+
+    symbol = signal.symbol.upper()
+    if symbol not in state["pairs"]:
+        return {"ok": False, "error": f"{symbol} takip edilmiyor"}
+
+    client = get_client()
+    pair = state["pairs"][symbol]
+
+    if signal.action.upper() == "BUY":
+        pos = get_position(symbol)
+        if pos["active"]:
+            return {"ok": False, "error": f"{symbol} zaten acik pozisyon var"}
+
+        trade_amt = state["trade_amount"]
+        if buy(client, symbol=symbol, usdt_amount=trade_amt):
+            rsi = pair.get("rsi", 50)
+            pair["trades"].insert(0, {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "action": "BUY", "price": signal.price or pair.get("price", 0),
+                "rsi": rsi, "pnl": None, "reason": "TV-WEBHOOK"})
+            pair["_watching"] = True
+            save_trade(symbol, "BUY", signal.price or pair.get("price", 0), rsi)
+            return {"ok": True, "action": "BUY", "symbol": symbol}
+
+    elif signal.action.upper() == "SELL":
+        pos = get_position(symbol)
+        if not pos["active"]:
+            return {"ok": False, "error": f"{symbol} acik pozisyon yok"}
+
+        rsi = pair.get("rsi", 50)
+        price = signal.price or pair.get("price", 0)
+        if _handle_sell(client, symbol, pair, price, rsi, "TV-WEBHOOK"):
+            return {"ok": True, "action": "SELL", "symbol": symbol}
+
+    return {"ok": False, "error": "Gecersiz islem"}
 
 
 @app.get("/audit")
