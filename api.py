@@ -226,7 +226,7 @@ def _update_stats(pair_state: dict, pnl: float):
 # ─── ÇIFT İŞLEMCİSİ ──────────────────────────────────────────────────────────
 def _handle_sell(client, symbol: str, pair: dict, price: float, rsi: float, reason: str):
     """Ortak satis islemi: snowball + db + bildirim."""
-    pos = get_position()
+    pos = get_position(symbol)
     entry_p = pos["entry_price"]
     qty = pos["quantity"]
 
@@ -274,14 +274,14 @@ def _process_pair(client, symbol: str):
         price = float(df["close"].iloc[-2])
 
         # Stop-loss kontrolu
-        pos = get_position()
+        pos = get_position(symbol)
         if pos["active"] and pair.get("_watching", False):
             drop = (pos["entry_price"] - price) / pos["entry_price"]
             if drop >= state["stop_loss_pct"]:
                 _handle_sell(client, symbol, pair, price, rsi, "STOP-LOSS")
 
         # Take-profit kontrolu
-        pos = get_position()
+        pos = get_position(symbol)
         if pos["active"] and pair.get("_watching", False):
             gain = (price - pos["entry_price"]) / pos["entry_price"]
             if gain >= state["take_profit_pct"]:
@@ -292,7 +292,7 @@ def _process_pair(client, symbol: str):
                             oversold=state["rsi_oversold"],
                             overbought=state["rsi_overbought"],
                             symbol=symbol)
-        pos    = get_position()
+        pos    = get_position(symbol)
 
         if signal == SIGNAL_BUY and not pos["active"]:
             # SNOWBALL: Dinamik islem miktari
@@ -315,7 +315,7 @@ def _process_pair(client, symbol: str):
         pair["trades"] = pair["trades"][:50]
 
         # Pozisyon PnL
-        pos  = get_position()
+        pos  = get_position(symbol)
         pnl  = round((price - pos["entry_price"]) * pos["quantity"], 4) if pos["active"] else 0.0
 
         # Price history
