@@ -26,8 +26,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import config
 from connection import get_client
 from data import get_ohlcv
-from indicators import add_rsi, get_latest_rsi
-from strategy import get_signal, SIGNAL_BUY, SIGNAL_SELL
+from indicators import add_rsi, add_all_indicators, get_latest_rsi, get_latest_macd, get_latest_bollinger
+from strategy import get_signal, SIGNAL_BUY, SIGNAL_SELL, SIGNAL_STRONG_BUY, SIGNAL_STRONG_SELL
 from executor import buy, sell, check_stop_loss, get_position
 from notifications import (notify_start, notify_stop, notify_buy,
                             notify_sell, notify_stop_loss, notify_take_profit, notify_error)
@@ -274,9 +274,17 @@ def _process_pair(client, symbol: str):
 
     try:
         df    = get_ohlcv(client, symbol=symbol)
-        df    = add_rsi(df, period=state["rsi_period"])
+        df    = add_all_indicators(df, rsi_period=state["rsi_period"])
         rsi   = float(df["rsi"].iloc[-2]) if not pd.isna(df["rsi"].iloc[-2]) else 50.0
         price = float(df["close"].iloc[-2])
+
+        # MACD ve Bollinger verilerini al
+        macd_data = get_latest_macd(df)
+        bb_data   = get_latest_bollinger(df)
+
+        # Pair state'e indikator verilerini ekle (dashboard icin)
+        pair["macd"] = macd_data
+        pair["bollinger"] = bb_data
 
         # Stop-loss kontrolu
         pos = get_position(symbol)
@@ -292,16 +300,22 @@ def _process_pair(client, symbol: str):
             if gain >= state["take_profit_pct"]:
                 _handle_sell(client, symbol, pair, price, rsi, "TAKE-PROFIT")
 
-        # RSI sinyali (state'deki dinamik esikleri kullan)
+        # BIRLESIK SINYAL: RSI + MACD + Bollinger
         signal = get_signal(rsi, price,
                             oversold=state["rsi_oversold"],
                             overbought=state["rsi_overbought"],
-                            symbol=symbol)
+                            symbol=symbol,
+                            macd=macd_data,
+                            bb=bb_data)
         pos    = get_position(symbol)
 
-        if signal == SIGNAL_BUY and not pos["active"]:
+        # STRONG_BUY ve BUY ikisi de alim sinyali
+        if signal in (SIGNAL_BUY, SIGNAL_STRONG_BUY) and not pos["active"]:
             # SNOWBALL: Dinamik islem miktari
+            # STRONG sinyalde %50 daha buyuk pozisyon (3/3 indikator uyusmus)
             trade_amt = state["trade_amount"]
+            if signal == SIGNAL_STRONG_BUY:
+                trade_amt = round(trade_amt * 1.5, 2)
 
             if buy(client, symbol=symbol, usdt_amount=trade_amt):
                 pair["trades"].insert(0, {
@@ -314,7 +328,7 @@ def _process_pair(client, symbol: str):
 
                 notify_buy(symbol, price, rsi, trade_amt)
 
-        elif signal == SIGNAL_SELL and pos["active"]:
+        elif signal in (SIGNAL_SELL, SIGNAL_STRONG_SELL) and pos["active"]:
             _handle_sell(client, symbol, pair, price, rsi, "RSI-SELL")
 
         pair["trades"] = pair["trades"][:50]
@@ -577,6 +591,22 @@ def get_snowball_stats():
     if not snowball:
         return {"enabled": False, "message": "Bot henuz baslamadi"}
     return {"enabled": True, **snowball.get_stats()}
+
+
+@app.get("/indicators/{symbol}")
+def get_indicators(symbol: str):
+    """Coin icin tum indikator verilerini dondur."""
+    pair = state["pairs"].get(symbol)
+    if not pair:
+        return {"error": f"{symbol} bulunamadi"}
+    return {
+        "symbol": symbol,
+        "price": pair.get("price", 0),
+        "rsi": pair.get("rsi", 0),
+        "signal": pair.get("signal", "HOLD"),
+        "macd": pair.get("macd", {}),
+        "bollinger": pair.get("bollinger", {}),
+    }
 
 
 @app.get("/db/summary")
