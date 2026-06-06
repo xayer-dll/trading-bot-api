@@ -26,12 +26,15 @@ SIGNAL_HOLD       = "HOLD"
 def get_signal(rsi: float, current_price: float,
                oversold: float = None, overbought: float = None,
                symbol: str = None,
-               macd: dict = None, bb: dict = None) -> str:
+               macd: dict = None, bb: dict = None,
+               trend: dict = None, volume: dict = None) -> str:
     """
     Birlesik sinyal uret.
 
     macd/bb verilmezse sadece RSI kullanir (geriye uyumlu).
-    Verilirse 3 indikator birlikte degerlendirilir.
+    trend (EMA200) ve volume verilirse AL sinyali filtrelenir:
+      - Fiyat EMA200 altindaysa ALMA (dusen bicagi tutma)
+      - Hacim ortalamanin altindaysa ALMA (likit degil)
     """
     ov_sold = oversold if oversold is not None else config.RSI_OVERSOLD
     ov_bought = overbought if overbought is not None else config.RSI_OVERBOUGHT
@@ -93,6 +96,27 @@ def get_signal(rsi: float, current_price: float,
         signal = SIGNAL_SELL
     else:
         signal = SIGNAL_HOLD
+
+    # ─── AKILLI FILTRELER (sadece AL sinyallerini filtreler) ─────────
+    # Satis sinyallerine dokunmuyoruz — elinde pozisyon varsa cikabilmeli.
+    if signal in (SIGNAL_BUY, SIGNAL_STRONG_BUY):
+        # MACD ZORUNLULUGU: Learner verisi: MACD+=%75 win, MACD-=%22 win
+        # MACD onaylamadan asla alma — en guclu tek filtre
+        if config.REQUIRE_MACD_FOR_BUY and not macd.get("bullish"):
+            reasons.append("X MACD onaysiz (%22 win skip)")
+            signal = SIGNAL_HOLD
+
+        # TREND FILTRESI: Fiyat EMA200 altindaysa = dusus trendi = ALMA
+        if signal in (SIGNAL_BUY, SIGNAL_STRONG_BUY) and config.USE_TREND_FILTER and trend is not None and trend.get("available"):
+            if not trend.get("above_ema"):
+                reasons.append("X EMA200 alti (dusus)")
+                signal = SIGNAL_HOLD
+
+        # HACIM FILTRESI: Hacim ortalamanin altindaysa = zayif hareket = ALMA
+        if signal != SIGNAL_HOLD and config.USE_VOLUME_FILTER and volume is not None and volume.get("available"):
+            if not volume.get("volume_ok"):
+                reasons.append("X dusuk hacim")
+                signal = SIGNAL_HOLD
 
     _print_signal(sym, current_price, rsi, signal, reasons)
     return signal

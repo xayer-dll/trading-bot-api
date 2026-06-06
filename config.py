@@ -19,19 +19,79 @@ LEVERAGE           = 5          # Varsayılan kaldıraç (1-20)
 # ─── İŞLEM PARAMETRELERİ ────────────────────────────────────────────────────
 SYMBOL          = "BTCUSDT"
 TIMEFRAME       = "1m"
-CANDLE_LIMIT    = 100
+CANDLE_LIMIT    = 250       # EMA200 trend filtresi icin 200+ mum lazim
 LOOP_INTERVAL   = 10        # Her kaç saniyede bir kontrol? (10-300 arası)
 
-# Takip edilecek ciftler (multi-pair)
+# ─── DURUSTLUK / GERCEKCILIK ────────────────────────────────────────────────
+TRADING_MODE    = "spot"    # "spot" = kaldirac YOK (durust). "futures" = gercek kaldirac
+FEE_RATE        = 0.001     # Binance spot taker komisyonu %0.1 (her islem)
+                            # Gidis-donus = %0.2, PnL'den dusulur
+
+# ─── STRATEJI FILTRELERI (akilli bot) ───────────────────────────────────────
+USE_TREND_FILTER  = True    # EMA200 ustunde degilse ALMA (dusen bicagi tutma)
+EMA_TREND_PERIOD  = 200     # Trend yonu icin EMA periyodu
+USE_VOLUME_FILTER = True    # Hacim ortalamasinin altindaysa ALMA (likit olmayan)
+VOLUME_SMA_PERIOD = 20      # Hacim ortalamasi periyodu
+USE_ATR_STOPS     = True    # Sabit % yerine volatiliteye gore dinamik stop
+ATR_PERIOD        = 14      # ATR periyodu
+ATR_STOP_MULT     = 1.5     # Stop-loss = giris - 1.5 x ATR
+ATR_TP_MULT       = 2.5     # Take-profit = giris + 2.5 x ATR
+
+# ─── MACD ZORUNLULUGU ───────────────────────────────────────────────────────
+# Learner verisi: MACD onaylı %75 kazanıyor, onsuz sadece %22.
+# True = BUY sinyali icin MACD bullish OLMAK ZORUNDA (en kritik filtre)
+REQUIRE_MACD_FOR_BUY = True
+
+# ─── MINIMUM KAR ESIGI ──────────────────────────────────────────────────────
+# RSI-SELL sinyalinde komisyonu GECEN bir kar olmadan satma (penny-scalping engelleyen)
+# 2.0 = komisyonun en az 2 kati kadar kar olmadan cikma (daha az islem, daha kaliteli)
+MIN_PROFIT_FEE_MULTIPLIER = 2.0
+
+# ─── TARANACAK COINLER (Learner verisiyle optimize edilmis) ─────────────────
+# Onceki sonuclar: 46 coin → %32 win rate, -423 USDT net zarar
+# Learner analizi: 22 coin %0-33 win rate ile zarar ettiriyor
+#
+# KALDIRILANLAR (Learner verisine gore kotu performans):
+#   BCHUSDT (%0), ENJUSDT (%0), XLMUSDT (dusuk), XRPUSDT (dusuk),
+#   SHIBUSDT (testnet likidite sorunu), FILUSDT, ICPUSDT, SANDUSDT,
+#   MANAUSDT, AXSUSDT, GALAUSDT, CHZUSDT, APEUSDT, FTMUSDT,
+#   SUSHIUSDT, YFIUSDT, 1INCHUSDT, THETAUSDT, EOSUSDT, XTZUSDT
+#
+# KALINANLAR: Yuksek likidite + testnet'te kanıtlanmis veya piyasa lideri
 SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT",
-    "BNBUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
+    # --- KANILANMIS KAZANANLAR (Learner: %67+ win) ---
+    "BTCUSDT",   # %67 win — en iyi coin
+    "ZRXUSDT",   # %75 win — surpriz performer
+
+    # --- PIYASA LIDERLERI (yuksek likidite = daha gercekci sinyaller) ---
+    "ETHUSDT",   # En buyuk altcoin, derin likidite
+    "BNBUSDT",   # Binance native — testnet'te en iyi desteklenen
+    "SOLUSDT",   # Yuksek volatilite = ATR stop'lar iyi calisiyor
+    "ADAUSDT",   # Sabit hareket, RSI okumalari gercekci
+    "AVAXUSDT",  # DeFi lideri, temiz sinyaller
+    "DOTUSDT",   # Orta volatilite, iyi RSI okumalari
+    "MATICUSDT", # Polygon, aktif testnet destegi
+    "LTCUSDT",   # BTC'ye benzer davranis, RSI iyi calisiyor
+
+    # --- DeFi (MACD filtresiyle daha temiz) ---
+    "UNIUSDT",   # DeFi DEX lideri
+    "AAVEUSDT",  # Lending lideri
+    "MKRUSDT",   # Stablecoin protokolu, dusuk korelasyon
+    "COMPUSDT",  # DeFi blue-chip
+    "GRTUSDT",   # Veri indeksi, ozgun hareket
+
+    # --- DIGER (testnet'te aktif, makul performans) ---
+    "ATOMUSDT",  # IBC ekosistemi, orta volatilite
+    "NEARUSDT",  # L1, aktif gelisim
+    "ARBUSDT",   # L2 lideri
+    "DOGEUSDT",  # Yuksek hacim — hacim filtresi iyi calisiyor
+    "ETCUSDT",   # Ethereum Classic
 ]
 
-# RSI — agresif ayarlar (daha sik islem)
+# RSI — daha kaliteli girisler icin dusuruldu (Learner onerisi)
 RSI_PERIOD      = 14
-RSI_OVERSOLD    = 35        # 30→35: daha erken al
-RSI_OVERBOUGHT  = 65        # 70→65: daha erken sat
+RSI_OVERSOLD    = 30        # 35→30: Learner: RSI 15-20 zonu %43 win → daha derin asirisatis
+RSI_OVERBOUGHT  = 68        # 65→68: Daha az erken cikis
 
 # Risk yonetimi
 TRADE_AMOUNT    = 10.0

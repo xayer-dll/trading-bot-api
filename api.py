@@ -27,9 +27,10 @@ from pydantic import BaseModel
 import config
 from connection import get_client
 from data import get_ohlcv
-from indicators import add_rsi, add_all_indicators, get_latest_rsi, get_latest_macd, get_latest_bollinger
+from indicators import (add_rsi, add_all_indicators, get_latest_rsi, get_latest_macd,
+                        get_latest_bollinger, get_latest_trend, get_latest_atr, get_latest_volume)
 from strategy import get_signal, SIGNAL_BUY, SIGNAL_SELL, SIGNAL_STRONG_BUY, SIGNAL_STRONG_SELL
-from executor import buy, sell, check_stop_loss, get_position
+from executor import buy, sell, check_stop_loss, get_position, load_positions_from_db
 from notifications import (notify_start, notify_stop, notify_buy,
                             notify_sell, notify_stop_loss, notify_take_profit, notify_error)
 from backtest import run_backtest
@@ -54,7 +55,8 @@ def _default_pair():
 
 state = {
     "running":          False,
-    "balance_usdt":     0.0,
+    "balance_usdt":     0.0,    # Serbest USDT (coine donusmemis)
+    "equity_usdt":      0.0,    # GERCEK portfoy = serbest USDT + acik pozisyon degeri
     "active_symbol":    config.SYMBOLS[0],
     "active_symbols":   list(config.SYMBOLS),   # Tum ciftler aktif: BTC, ETH, SOL
     "pairs":            {s: _default_pair() for s in config.SYMBOLS},
@@ -215,6 +217,25 @@ def _update_balance(client) -> float:
     return 0.0
 
 
+def _compute_equity() -> float:
+    """
+    GERCEK portfoy degeri = serbest USDT + acik pozisyonlardaki coinlerin degeri.
+
+    Neden lazim? Bot spot coin alinca serbest USDT duser ama para kaybolmaz —
+    coine donusur. Sadece serbest USDT'ye bakmak yaniltici. Toplam deger sabit
+    kalmali (komisyon/kar haric).
+    """
+    free = state["balance_usdt"]
+    holdings = 0.0
+    for sym in list(state["active_symbols"]):
+        pos = get_position(sym)
+        if pos.get("active"):
+            # Eldeki coin degeri = miktar x guncel fiyat
+            price = state["pairs"].get(sym, {}).get("price", 0) or pos["entry_price"]
+            holdings += pos["quantity"] * price
+    return round(free + holdings, 2)
+
+
 def _update_stats(pair_state: dict, pnl: float):
     st = pair_state["stats"]
     st["total_trades"] += 1
@@ -234,17 +255,23 @@ def _handle_sell(client, symbol: str, pair: dict, price: float, rsi: float, reas
     pos = get_position(symbol)
     entry_p = pos["entry_price"]
     qty = pos["quantity"]
+    margin_used = pos.get("margin_used", state.get("trade_amount", 10))  # BUG FIX #2: Alis anindaki gercek marjin
 
-    if sell(client, symbol=symbol, reason=reason):
-        # KALDIRACLI PnL: spot pnl x kaldirac
-        spot_pnl = round((price - entry_p) * qty, 4)
-        leverage = state.get("leverage", 1)
-        pnl = round(spot_pnl * leverage, 4)
+    sell_result = sell(client, symbol=symbol, reason=reason)
+    if sell_result.get("ok"):
+        # BUG FIX #3: Gercek execution fiyatini kullan (candle close degil)
+        exec_price = sell_result.get("exec_price", price)
+
+        # ─── DURUST SPOT PnL (kaldirac YOK, komisyon DAHIL) ──────────────
+        # ESKI BUG: pnl = spot_pnl x 5 (sahte kaldirac, $19k bug'inin kardesi)
+        # SIMDI: gercek spot kar - alis/satis komisyonu
+        gross_pnl = (exec_price - entry_p) * qty
+        fee = (entry_p * qty + exec_price * qty) * config.FEE_RATE  # gidis+donus komisyon
+        pnl = round(gross_pnl - fee, 4)
 
         _update_stats(pair, pnl)
 
         # SNOWBALL: Kaldiracli PnL kaydet
-        margin_used = state.get("trade_amount", 10)
         if snowball:
             snowball.record_trade(pnl, symbol, margin_used=margin_used)
             state["trade_amount"] = snowball.calculate_trade_amount()
@@ -255,10 +282,11 @@ def _handle_sell(client, symbol: str, pair: dict, price: float, rsi: float, reas
                 "symbol": symbol,
                 "action": "SELL",
                 "entry_price": entry_p,
-                "exit_price": price,
+                "exit_price": exec_price,  # BUG FIX #3: Gercek execution fiyati
                 "quantity": qty,
                 "pnl": pnl,
-                "margin": margin_used,
+                "fee": round(fee, 4),      # Komisyon (auditor PnL dogrulamasi icin)
+                "margin": margin_used,     # BUG FIX #2: Gercek marjin
                 "reason": reason,
                 "timestamp": datetime.now().isoformat(),
             })
@@ -277,7 +305,7 @@ def _handle_sell(client, symbol: str, pair: dict, price: float, rsi: float, reas
                 "symbol": symbol,
                 "action": "SELL",
                 "entry_price": entry_p,
-                "exit_price": price,
+                "exit_price": exec_price,  # BUG FIX #3: Gercek execution fiyati
                 "pnl": pnl,
                 "rsi_at_entry": pair.get("_entry_rsi", 50),
                 "rsi_at_exit": rsi,
@@ -287,25 +315,25 @@ def _handle_sell(client, symbol: str, pair: dict, price: float, rsi: float, reas
                 "timestamp": datetime.now().isoformat(),
             })
 
-        # DATABASE: Islemi kaydet
-        save_trade(symbol, "SELL", price, rsi, pnl=pnl, reason=reason)
+        # DATABASE: Islemi kaydet (gercek execution fiyatiyla)
+        save_trade(symbol, "SELL", exec_price, rsi, pnl=pnl, reason=reason)
         save_stats(symbol, pair["stats"])
 
         pair["trades"].insert(0, {
             "time": datetime.now().strftime("%H:%M:%S"),
-            "action": "SELL", "price": price, "rsi": round(rsi, 2),
+            "action": "SELL", "price": exec_price, "rsi": round(rsi, 2),
             "pnl": pnl, "reason": reason})
         pair["_watching"] = False
 
         # Bildirimler
         if reason == "STOP-LOSS":
-            drop = (entry_p - price) / entry_p
-            notify_stop_loss(symbol, price, drop * 100)
+            drop = (entry_p - exec_price) / entry_p
+            notify_stop_loss(symbol, exec_price, drop * 100)
         elif reason == "TAKE-PROFIT":
-            gain = (price - entry_p) / entry_p
-            notify_take_profit(symbol, price, gain * 100)
+            gain = (exec_price - entry_p) / entry_p
+            notify_take_profit(symbol, exec_price, gain * 100)
         else:
-            notify_sell(symbol, price, rsi, pnl, reason)
+            notify_sell(symbol, exec_price, rsi, pnl, reason)
 
         return True
     return False
@@ -321,44 +349,71 @@ def _process_pair(client, symbol: str):
         rsi   = float(df["rsi"].iloc[-2]) if not pd.isna(df["rsi"].iloc[-2]) else 50.0
         price = float(df["close"].iloc[-2])
 
-        # MACD ve Bollinger verilerini al
+        # MACD, Bollinger, Trend(EMA200), ATR, Hacim verilerini al
         macd_data = get_latest_macd(df)
         bb_data   = get_latest_bollinger(df)
+        trend_data = get_latest_trend(df)
+        atr_val    = get_latest_atr(df)
+        vol_data   = get_latest_volume(df)
 
         # Pair state'e indikator verilerini ekle (dashboard icin)
         pair["macd"] = macd_data
         pair["bollinger"] = bb_data
+        pair["trend"] = trend_data
+        pair["atr"] = atr_val
+        pair["volume_info"] = vol_data
 
-        # Stop-loss kontrolu
+        # Stop-loss kontrolu (ATR dinamik veya sabit %)
         pos = get_position(symbol)
         if pos["active"] and pair.get("_watching", False):
-            drop = (pos["entry_price"] - price) / pos["entry_price"]
-            if drop >= state["stop_loss_pct"]:
-                _handle_sell(client, symbol, pair, price, rsi, "STOP-LOSS")
+            entry = pos["entry_price"]
+            # Dinamik stop: giristeki ATR'ye gore. Yoksa sabit %.
+            entry_atr = pair.get("_entry_atr", 0)
+            if config.USE_ATR_STOPS and entry_atr > 0:
+                stop_price = entry - config.ATR_STOP_MULT * entry_atr
+                if price <= stop_price:
+                    _handle_sell(client, symbol, pair, price, rsi, "STOP-LOSS")
+            else:
+                drop = (entry - price) / entry
+                if drop >= state["stop_loss_pct"]:
+                    _handle_sell(client, symbol, pair, price, rsi, "STOP-LOSS")
 
-        # Take-profit kontrolu
+        # Take-profit kontrolu (ATR dinamik veya sabit %)
         pos = get_position(symbol)
         if pos["active"] and pair.get("_watching", False):
-            gain = (price - pos["entry_price"]) / pos["entry_price"]
-            if gain >= state["take_profit_pct"]:
-                _handle_sell(client, symbol, pair, price, rsi, "TAKE-PROFIT")
+            entry = pos["entry_price"]
+            entry_atr = pair.get("_entry_atr", 0)
+            if config.USE_ATR_STOPS and entry_atr > 0:
+                tp_price = entry + config.ATR_TP_MULT * entry_atr
+                if price >= tp_price:
+                    _handle_sell(client, symbol, pair, price, rsi, "TAKE-PROFIT")
+            else:
+                gain = (price - entry) / entry
+                if gain >= state["take_profit_pct"]:
+                    _handle_sell(client, symbol, pair, price, rsi, "TAKE-PROFIT")
 
-        # BIRLESIK SINYAL: RSI + MACD + Bollinger
+        # BIRLESIK SINYAL: RSI + MACD + BB + Trend filtresi + Hacim filtresi
         signal = get_signal(rsi, price,
                             oversold=state["rsi_oversold"],
                             overbought=state["rsi_overbought"],
                             symbol=symbol,
                             macd=macd_data,
-                            bb=bb_data)
+                            bb=bb_data,
+                            trend=trend_data,
+                            volume=vol_data)
         pos    = get_position(symbol)
 
         # STRONG_BUY ve BUY ikisi de alim sinyali
         if signal in (SIGNAL_BUY, SIGNAL_STRONG_BUY) and not pos["active"]:
             # SNOWBALL: Dinamik islem miktari
-            # STRONG sinyalde %50 daha buyuk pozisyon (3/3 indikator uyusmus)
+            # STRONG_BUY: Learner=%0 win rate → KUCUK pozisyon (1.5x değil 0.7x)
+            # BUY: Normal pozisyon
             trade_amt = state["trade_amount"]
             if signal == SIGNAL_STRONG_BUY:
-                trade_amt = round(trade_amt * 1.5, 2)
+                # ESKI: trade_amt * 1.5 → buyuk pozisyon (%0 win ratede FELAKET)
+                # YENI: trade_amt * 0.7 → kucuk pozisyon (daha ihtiyatli)
+                trade_amt = round(trade_amt * 0.7, 2)
+                print(f"  [STRONG_BUY UYARI] {symbol}: Learner=%0 win → kucuk pozisyon ${trade_amt}")
 
             # LEARNER: Bu coinde islem yapmali mi?
             if learner and not learner.should_trade(symbol):
@@ -370,6 +425,17 @@ def _process_pair(client, symbol: str):
                 pair["_watching"] = True
                 pair["_entry_rsi"] = round(rsi, 2)      # Learner icin giris RSI
                 pair["_entry_signal"] = signal            # Learner icin sinyal tipi
+                pair["_entry_margin"] = trade_amt         # BUG FIX #2: Gercek marjin kaydi
+                pair["_entry_atr"] = atr_val              # ATR dinamik stop icin
+
+                # DB'ye pozisyon RSI/signal/ATR bilgisini de kaydet (restart icin)
+                from database import save_position as _db_save_pos
+                try:
+                    pos_now = get_position(symbol)
+                    _db_save_pos(symbol, pos_now["entry_price"], pos_now["quantity"],
+                                 trade_amt, round(rsi, 2), signal, atr_val)
+                except Exception:
+                    pass
 
                 # AUDITOR: Alim islemini kaydet
                 if auditor:
@@ -377,6 +443,7 @@ def _process_pair(client, symbol: str):
                         "symbol": symbol, "action": "BUY",
                         "entry_price": price, "exit_price": 0,
                         "quantity": 0, "pnl": None,
+                        "margin": trade_amt,
                         "timestamp": datetime.now().isoformat(),
                     })
 
@@ -386,14 +453,31 @@ def _process_pair(client, symbol: str):
                 notify_buy(symbol, price, rsi, trade_amt)
 
         elif signal in (SIGNAL_SELL, SIGNAL_STRONG_SELL) and pos["active"]:
-            _handle_sell(client, symbol, pair, price, rsi, "RSI-SELL")
+            # MINIMUM KAR ESIGI: Komisyonun belli katini gecmeden penny-satma
+            # Eski davranis: +0.24 USDT kazanci icin bile satti → komisyona para yaktı
+            # Yeni davranis: RSI-SELL sinyalinde yeterli kar yoksa bekle
+            # NOT: STOP-LOSS ve TAKE-PROFIT bu kontrolden muaf (zarar durdurma gecmez)
+            entry_p  = pos["entry_price"]
+            qty      = pos["quantity"]
+            gross    = (price - entry_p) * qty
+            est_fee  = (entry_p + price) * qty * config.FEE_RATE
+            min_profit = est_fee * config.MIN_PROFIT_FEE_MULTIPLIER
+            if gross < min_profit:
+                # Yeterli kar yok — bekle, RSI sinyalini atla
+                print(f"  [{symbol}] RSI-SELL ATLIYOR: kar=${gross:.3f} < esik=${min_profit:.3f} (komisyon={est_fee:.3f})")
+            else:
+                _handle_sell(client, symbol, pair, price, rsi, "RSI-SELL")
 
         pair["trades"] = pair["trades"][:50]
 
-        # Pozisyon PnL (kaldiracli)
+        # Pozisyon PnL (DURUST spot — kaldirac yok, komisyon dahil)
         pos  = get_position(symbol)
-        leverage = state.get("leverage", 1)
-        pnl  = round((price - pos["entry_price"]) * pos["quantity"] * leverage, 4) if pos["active"] else 0.0
+        if pos["active"]:
+            gross = (price - pos["entry_price"]) * pos["quantity"]
+            est_fee = (pos["entry_price"] + price) * pos["quantity"] * config.FEE_RATE
+            pnl = round(gross - est_fee, 4)
+        else:
+            pnl = 0.0
 
         # Price history
         new_hist = _build_history(df)
@@ -425,14 +509,38 @@ def bot_loop():
     # SNOWBALL + AUDITOR + LEARNER baslat
     try:
         _update_balance(client)
-        snowball = SnowballEngine(initial_balance=state["balance_usdt"], leverage=state["leverage"])
-        auditor = TradeAuditor(leverage=state["leverage"])
+        # SPOT MODU: kaldirac=1 (durust muhasebe). Futures modunda gercek kaldirac.
+        effective_leverage = 1 if config.TRADING_MODE == "spot" else state["leverage"]
+        snowball = SnowballEngine(initial_balance=state["balance_usdt"], leverage=effective_leverage)
+        auditor = TradeAuditor(leverage=effective_leverage)
         learner = TradeLearner()
         print("[AUDIT] Denetim motoru aktif — her 5 islemde otomatik tarama")
         print("[LEARNER] Ogrenme motoru aktif — islemlerden ders cikaracak")
         state["trade_amount"] = snowball.calculate_trade_amount()
         print(f"[SNOWBALL] Baslangic bakiye: ${state['balance_usdt']:.2f}")
         print(f"[SNOWBALL] Ilk islem miktari: ${state['trade_amount']:.2f}")
+
+        # BUG FIX #1: Restart sonrasi acik pozisyonlari DB'den yukle
+        restored_positions = load_positions_from_db()
+        for rp in restored_positions:
+            sym = rp["symbol"]
+            pair = state["pairs"].get(sym)
+            if pair:
+                pair["_watching"] = True
+                pair["_entry_rsi"] = rp.get("entry_rsi", 50)
+                pair["_entry_signal"] = rp.get("entry_signal", "BUY")
+                pair["_entry_margin"] = rp.get("margin_used", state["trade_amount"])
+                pair["_entry_atr"] = rp.get("entry_atr", 0)
+                print(f"[RESTORE] {sym} pozisyon aktif: giris=${rp['entry_price']:.2f}")
+
+        # Pozisyonlar yuklendikten sonra GERCEK portfoy degerini hesapla
+        # (serbest USDT + eldeki coinler) ve snowball baslangicini buna ayarla
+        init_equity = _compute_equity()
+        state["equity_usdt"] = init_equity
+        snowball.initial_balance = init_equity
+        snowball.current_balance = init_equity
+        state["trade_amount"] = snowball.calculate_trade_amount()
+        print(f"[SNOWBALL] Gercek portfoy degeri: ${init_equity:.2f}")
 
         # Onceki istatistikleri DB'den yukle
         for sym in config.SYMBOLS:
@@ -462,12 +570,24 @@ def bot_loop():
             print(f"[POLY HATA] Baslatilamadi: {e}")
             state["polymarket_enabled"] = False
 
-    # Ilk yukleme
-    try:
-        for s in state["active_symbols"]:
+    # Ilk yukleme — testnet'te olmayan ciftleri otomatik cikar
+    valid_symbols = []
+    for s in list(state["active_symbols"]):
+        try:
             df = get_ohlcv(client, symbol=s)
             df = add_rsi(df, period=state["rsi_period"])
             state["pairs"][s]["price_history"] = _build_history(df)
+            valid_symbols.append(s)
+        except Exception as e:
+            print(f"[SKIP] {s} testnet'te yok veya hata: {e}")
+            # Pair'i state'den temizle
+            if s in state["pairs"]:
+                del state["pairs"][s]
+
+    state["active_symbols"] = valid_symbols
+    print(f"[COINS] {len(valid_symbols)} coin aktif: {', '.join(valid_symbols)}")
+
+    try:
         state["equity_history"].append({
             "t": datetime.now().strftime("%H:%M"),
             "balance": state["balance_usdt"]})
@@ -501,16 +621,20 @@ def bot_loop():
             except Exception:
                 pass
 
-        # Bakiye gecmisi + DB kaydi
+        # GERCEK portfoy degeri = serbest USDT + acik coinlerin degeri
+        equity = _compute_equity()
+        state["equity_usdt"] = equity
+
+        # Bakiye gecmisi + DB kaydi (toplam portfoy degeri uzerinden)
         state["equity_history"].append({
             "t": datetime.now().strftime("%H:%M"),
-            "balance": state["balance_usdt"]})
+            "balance": equity})
         state["equity_history"] = state["equity_history"][-200:]
-        save_equity(state["balance_usdt"])
+        save_equity(equity)
 
-        # SNOWBALL: Gercek bakiyeyi sync et
+        # SNOWBALL: Gercek portfoy degerini sync et (serbest USDT degil!)
         if snowball:
-            snowball.sync_balance(state["balance_usdt"])
+            snowball.sync_balance(equity)
 
         # Ayarlanabilir bekleme süresi (1'er saniyelik adımlarla kontrol eder)
         for _ in range(state["loop_interval"]):
