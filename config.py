@@ -75,13 +75,12 @@ SYMBOLS = [
 
     # --- DeFi (MACD filtresiyle daha temiz) ---
     "UNIUSDT",   # DeFi DEX lideri
-    "AAVEUSDT",  # Lending lideri
+    # AAVEUSDT kaldirildi — Learner: %33 win, -7.67 USDT zarar
     "MKRUSDT",   # Stablecoin protokolu, dusuk korelasyon
     "COMPUSDT",  # DeFi blue-chip
     "GRTUSDT",   # Veri indeksi, ozgun hareket
 
     # --- DIGER (testnet'te aktif, makul performans) ---
-    "ATOMUSDT",  # IBC ekosistemi, orta volatilite
     "NEARUSDT",  # L1, aktif gelisim
     "ARBUSDT",   # L2 lideri
     "DOGEUSDT",  # Yuksek hacim — hacim filtresi iyi calisiyor
