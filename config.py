@@ -47,44 +47,25 @@ REQUIRE_MACD_FOR_BUY = True
 # 2.0 = komisyonun en az 2 kati kadar kar olmadan cikma (daha az islem, daha kaliteli)
 MIN_PROFIT_FEE_MULTIPLIER = 2.0
 
-# ─── TARANACAK COINLER (Learner verisiyle optimize edilmis) ─────────────────
-# Onceki sonuclar: 46 coin → %32 win rate, -423 USDT net zarar
-# Learner analizi: 22 coin %0-33 win rate ile zarar ettiriyor
-#
-# KALDIRILANLAR (Learner verisine gore kotu performans):
-#   BCHUSDT (%0), ENJUSDT (%0), XLMUSDT (dusuk), XRPUSDT (dusuk),
-#   SHIBUSDT (testnet likidite sorunu), FILUSDT, ICPUSDT, SANDUSDT,
-#   MANAUSDT, AXSUSDT, GALAUSDT, CHZUSDT, APEUSDT, FTMUSDT,
-#   SUSHIUSDT, YFIUSDT, 1INCHUSDT, THETAUSDT, EOSUSDT, XTZUSDT
-#
-# KALINANLAR: Yuksek likidite + testnet'te kanıtlanmis veya piyasa lideri
+# ─── TARANACAK COINLER ──────────────────────────────────────────────────────
+# Elle coin cikarmiyoruz — Learner otomatik karar verir:
+#   Min 10 islem sonrasi win rate < %30  → gecici bypass (islem yapma)
+#   Win rate > %50'ye cikinca            → otomatik geri al
+# 2 ay sonra sistem hangi coinin karli oldugunu kendi ogrenir.
 SYMBOLS = [
-    # --- KANILANMIS KAZANANLAR (Learner: %67+ win) ---
-    "BTCUSDT",   # %67 win — en iyi coin
-    "ZRXUSDT",   # %75 win — surpriz performer
-
-    # --- PIYASA LIDERLERI (yuksek likidite = daha gercekci sinyaller) ---
-    "ETHUSDT",   # En buyuk altcoin, derin likidite
-    "BNBUSDT",   # Binance native — testnet'te en iyi desteklenen
-    "SOLUSDT",   # Yuksek volatilite = ATR stop'lar iyi calisiyor
-    "ADAUSDT",   # Sabit hareket, RSI okumalari gercekci
-    "AVAXUSDT",  # DeFi lideri, temiz sinyaller
-    "DOTUSDT",   # Orta volatilite, iyi RSI okumalari
-    "MATICUSDT", # Polygon, aktif testnet destegi
-    "LTCUSDT",   # BTC'ye benzer davranis, RSI iyi calisiyor
-
-    # --- DeFi (MACD filtresiyle daha temiz) ---
-    "UNIUSDT",   # DeFi DEX lideri
-    # AAVEUSDT kaldirildi — Learner: %33 win, -7.67 USDT zarar
-    "MKRUSDT",   # Stablecoin protokolu, dusuk korelasyon
-    "COMPUSDT",  # DeFi blue-chip
-    "GRTUSDT",   # Veri indeksi, ozgun hareket
-
-    # --- DIGER (testnet'te aktif, makul performans) ---
-    "NEARUSDT",  # L1, aktif gelisim
-    "ARBUSDT",   # L2 lideri
-    "DOGEUSDT",  # Yuksek hacim — hacim filtresi iyi calisiyor
-    "ETCUSDT",   # Ethereum Classic
+    # --- BUYUK PIYASA ---
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
+    # --- ORTA PIYASA ---
+    "MATICUSDT", "LTCUSDT", "ATOMUSDT", "UNIUSDT", "ETCUSDT",
+    # --- DeFi ---
+    "AAVEUSDT", "GRTUSDT", "MKRUSDT", "COMPUSDT",
+    # --- L2 / YENI NESIL ---
+    "ARBUSDT", "OPUSDT", "NEARUSDT", "APTUSDT",
+    # --- KANITMIS PERFORMERS ---
+    "ZRXUSDT", "RUNEUSDT",
+    # --- DIGER ---
+    "ALGOUSDT", "CRVUSDT", "LDOUSDT", "SNXUSDT",
 ]
 
 # RSI — daha kaliteli girisler icin dusuruldu (Learner onerisi)

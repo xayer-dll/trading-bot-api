@@ -1,19 +1,18 @@
-# learner.py -- Gecmis islemlerden ogrenen strateji motoru
+# learner.py -- Gecmis islemlerden ogrenen ve OTOMATIK UYGULAYAN strateji motoru
 #
-# NE YAPIYOR?
-#   1. Her islemi kaydeder ve analiz eder
-#   2. Hangi RSI seviyesinde alim karli?
-#   3. Hangi saatlerde islem daha basarili?
-#   4. Hangi coinler daha karli?
-#   5. MACD/BB sinyalleri ne kadar dogu?
-#   6. Bu bilgilerle strateji parametrelerini OTOMATIK ayarlar
+# FELSEFE:
+#   Elle coin cikarmiyoruz. Sistem kendi ogrenir, kendi karar verir.
+#   2 ay sonra hangi coinin karli oldugunu sistem biliyor olmali.
 #
-# ORNEK OGRENME:
-#   "RSI 28'de alim yaptigimda %80 kazandim ama RSI 34'te aldigimda %40 kazandim"
-#   → Sonuc: RSI esigini 30'a dusur (daha az ama daha kaliteli sinyal)
+# OTOMATIK KARARLAR (oneri degil, eylem):
+#   1. COIN BYPASS: Min 10 islem + win rate < %30 → o coine islem yapma
+#      Win rate > %50'ye cikinca → otomatik geri al (rehabilitasyon)
+#   2. RSI ESIGI: En karli RSI bolgesini bulur, state'e uygular
+#   3. SAAT FILTRESI: Kotu saatlerde yeni pozisyon acma
+#   4. MACD ZORUNLULUGU: Veri MACD'siz daha iyiyse filtre kaldirilir
 #
-#   "MACD onayiyla yapilan islemler %70 kazandi, MACD'siz %45 kazandi"
-#   → Sonuc: MACD onayini zorunlu tut
+# MINIMUM VERI ESIGI:
+#   10 islem olmadan hicbir karari uygulamaz — az veriyle yanlis karar vermez
 
 import logging
 from datetime import datetime
@@ -22,41 +21,50 @@ from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
+# Otomatik karar esikleri
+MIN_TRADES_FOR_DECISION  = 10   # En az bu kadar islem olmadan karar yok
+BYPASS_WIN_RATE_THRESHOLD = 0.30  # %30 alti → bypass
+RECOVER_WIN_RATE_THRESHOLD = 0.50  # %50 ustu → bypass kaldir
+BAD_HOUR_THRESHOLD        = 0.25  # %25 alti win rate → o saat kotu
+GOOD_HOUR_MIN_TRADES      = 3    # Saat karari icin minimum islem
+
 
 class TradeLearner:
     """
-    Gecmis islemlerden ogrenen strateji optimizasyonu.
+    Gecmis islemlerden ogrenen VE otomatik uygulayan strateji motoru.
     """
 
     def __init__(self):
-        self.trades = []               # Tum islem gecmisi
-        self.lessons = []              # Ogrenilen dersler
-        self.recommendations = {}      # Aktif oneriler
+        self.trades = []
+        self.lessons = []
+        self.recommendations = {}
 
         # Analiz verileri
-        self.rsi_performance = defaultdict(lambda: {"wins": 0, "losses": 0, "total_pnl": 0})
-        self.symbol_performance = defaultdict(lambda: {"wins": 0, "losses": 0, "total_pnl": 0, "trades": 0})
-        self.hour_performance = defaultdict(lambda: {"wins": 0, "losses": 0, "total_pnl": 0})
+        self.rsi_performance   = defaultdict(lambda: {"wins": 0, "losses": 0, "total_pnl": 0})
+        self.symbol_performance = defaultdict(lambda: {"wins": 0, "losses": 0, "total_pnl": 0})
+        self.hour_performance  = defaultdict(lambda: {"wins": 0, "losses": 0, "total_pnl": 0})
         self.signal_type_performance = defaultdict(lambda: {"wins": 0, "losses": 0, "total_pnl": 0})
-        self.macd_accuracy = {"with_macd": {"wins": 0, "total": 0}, "without_macd": {"wins": 0, "total": 0}}
-
-        print("[LEARNER] Ogrenme motoru basladi")
-
-    def record_trade(self, trade: Dict):
-        """
-        Islem kaydet ve analiz et.
-
-        trade: {
-            symbol, action, entry_price, exit_price,
-            pnl, rsi_at_entry, rsi_at_exit,
-            macd_bullish, bb_signal, signal_type,
-            timestamp, reason
+        self.macd_accuracy = {
+            "with_macd":    {"wins": 0, "total": 0},
+            "without_macd": {"wins": 0, "total": 0},
         }
-        """
-        self.trades.append(trade)
-        self.trades = self.trades[-500:]  # Son 500 islem
 
-        # Sadece kapanmis islemleri analiz et (SELL)
+        # ── OTOMATIK KARARLAR (bunlar gercekten uygulanir) ──────────────
+        self._bypassed_coins: Dict[str, str] = {}   # symbol → bypass sebebi
+        self._bad_hours: List[int] = []              # Yeni pozisyon acilamayan saatler
+        self._applied_rsi_oversold: Optional[float] = None  # Uygulanan RSI esigi
+
+        print("[LEARNER] Otomatik ogrenme + uygulama motoru basladi")
+        print(f"[LEARNER] Esikler: bypass<{BYPASS_WIN_RATE_THRESHOLD*100:.0f}% | "
+              f"rehabilite>{RECOVER_WIN_RATE_THRESHOLD*100:.0f}% | "
+              f"min_islem={MIN_TRADES_FOR_DECISION}")
+
+    # ─────────────────────────────────────────────────────────────────────
+    def record_trade(self, trade: Dict):
+        """Islem kaydet ve analiz et."""
+        self.trades.append(trade)
+        self.trades = self.trades[-1000:]  # Son 1000 islem
+
         if trade.get("action") != "SELL":
             return
 
@@ -64,48 +72,34 @@ class TradeLearner:
         if pnl is None:
             return
 
-        is_win = pnl > 0
-        symbol = trade.get("symbol", "?")
+        is_win  = pnl > 0
+        symbol  = trade.get("symbol", "?")
         rsi_entry = trade.get("rsi_at_entry", 50)
 
-        # 1. RSI seviye performansi
-        # RSI'yi 5'er grupla: 0-5, 5-10, ..., 95-100
+        # 1. RSI performansi (5'er grupla)
         rsi_bucket = int(rsi_entry // 5) * 5
-        perf = self.rsi_performance[rsi_bucket]
-        if is_win:
-            perf["wins"] += 1
-        else:
-            perf["losses"] += 1
-        perf["total_pnl"] += pnl
+        p = self.rsi_performance[rsi_bucket]
+        p["wins" if is_win else "losses"] += 1
+        p["total_pnl"] += pnl
 
         # 2. Coin performansi
         sp = self.symbol_performance[symbol]
-        sp["trades"] += 1
+        sp["wins" if is_win else "losses"] += 1
         sp["total_pnl"] += pnl
-        if is_win:
-            sp["wins"] += 1
-        else:
-            sp["losses"] += 1
 
         # 3. Saat performansi
         try:
-            hour = datetime.now().hour
-            hp = self.hour_performance[hour]
-            if is_win:
-                hp["wins"] += 1
-            else:
-                hp["losses"] += 1
-            hp["total_pnl"] += pnl
+            hour = datetime.fromisoformat(trade["timestamp"]).hour
         except Exception:
-            pass
+            hour = datetime.now().hour
+        hp = self.hour_performance[hour]
+        hp["wins" if is_win else "losses"] += 1
+        hp["total_pnl"] += pnl
 
-        # 4. Sinyal tipi performansi
+        # 4. Sinyal tipi
         sig_type = trade.get("signal_type", "BUY")
         stp = self.signal_type_performance[sig_type]
-        if is_win:
-            stp["wins"] += 1
-        else:
-            stp["losses"] += 1
+        stp["wins" if is_win else "losses"] += 1
         stp["total_pnl"] += pnl
 
         # 5. MACD onay performansi
@@ -116,136 +110,169 @@ class TradeLearner:
             if is_win:
                 self.macd_accuracy[key]["wins"] += 1
 
-        # Her 10 islemde oneriler guncelle
+        # Her 5 islemde kararlari guncelle
         sell_count = sum(1 for t in self.trades if t.get("action") == "SELL")
-        if sell_count > 0 and sell_count % 10 == 0:
-            self._generate_recommendations()
+        if sell_count > 0 and sell_count % 5 == 0:
+            self._apply_decisions()
 
-    def _generate_recommendations(self):
-        """Verilerden strateji onerileri olustur."""
+    # ─────────────────────────────────────────────────────────────────────
+    def _apply_decisions(self):
+        """
+        Veriye bakarak KARARLAR UYGULA.
+        Sadece oneri degil — gercekten bypass, saat filtresi, RSI degisikl.
+        """
         self.lessons = []
         self.recommendations = {}
+        changed = []
 
-        # 1. En iyi RSI alim seviyeleri
+        # ── 1. COIN BYPASS / REHABILITASYON ─────────────────────────────
+        for sym, perf in self.symbol_performance.items():
+            total = perf["wins"] + perf["losses"]
+            if total < MIN_TRADES_FOR_DECISION:
+                continue  # Yeterli veri yok — karar verme
+
+            wr = perf["wins"] / total
+
+            if wr < BYPASS_WIN_RATE_THRESHOLD and sym not in self._bypassed_coins:
+                # Yeni bypass
+                reason = f"%{wr*100:.0f} win ({total} islem, pnl={perf['total_pnl']:+.2f})"
+                self._bypassed_coins[sym] = reason
+                changed.append(f"BYPASS: {sym} ({reason})")
+                print(f"[LEARNER] OTOMATIK BYPASS: {sym} — {reason}")
+
+            elif wr >= RECOVER_WIN_RATE_THRESHOLD and sym in self._bypassed_coins:
+                # Rehabilitasyon — tekrar al
+                del self._bypassed_coins[sym]
+                changed.append(f"REHABILITE: {sym} (win rate %{wr*100:.0f}'e yukseldi)")
+                print(f"[LEARNER] REHABILITASYON: {sym} — tekrar aktif, win=%{wr*100:.0f}")
+
+        # ── 2. KOTU SAAT FILTRESI ────────────────────────────────────────
+        bad_hours = []
+        for hour, perf in self.hour_performance.items():
+            total = perf["wins"] + perf["losses"]
+            if total < GOOD_HOUR_MIN_TRADES:
+                continue
+            wr = perf["wins"] / total
+            if wr <= BAD_HOUR_THRESHOLD:
+                bad_hours.append(hour)
+
+        if bad_hours != self._bad_hours:
+            self._bad_hours = bad_hours
+            if bad_hours:
+                changed.append(f"KOTU SAATLER guncellendi: {sorted(bad_hours)}")
+                print(f"[LEARNER] Kotu saatler: {sorted(bad_hours)} — bu saatlerde yeni pozisyon yok")
+
+        # ── 3. RSI ESIGI ONERISI ─────────────────────────────────────────
         best_rsi = None
-        best_rsi_winrate = 0
+        best_wr  = 0
         for rsi_level, perf in self.rsi_performance.items():
             total = perf["wins"] + perf["losses"]
-            if total >= 3:  # En az 3 islem
+            if total >= 5:
                 wr = perf["wins"] / total
-                if wr > best_rsi_winrate:
-                    best_rsi_winrate = wr
+                if wr > best_wr:
+                    best_wr  = wr
                     best_rsi = rsi_level
 
         if best_rsi is not None:
+            suggested = best_rsi + 5  # RSI 20 bolgesi → esik 25 olsun
+            suggested = max(20, min(40, suggested))  # Guvenli aralik
+            if suggested != self._applied_rsi_oversold:
+                self._applied_rsi_oversold = suggested
+                self.recommendations["rsi_oversold"] = suggested
+                changed.append(f"RSI esigi onerisi: {suggested} (en iyi: {best_rsi}-{best_rsi+5} @ %{best_wr*100:.0f})")
+
+        # ── 4. DERSLER (loglama icin) ────────────────────────────────────
+        if self._bypassed_coins:
             self.lessons.append(
-                f"En basarili alim RSI={best_rsi}-{best_rsi+5} bolgesinde "
-                f"(kazanma orani: %{best_rsi_winrate*100:.0f})"
+                f"Bypass'taki coinler ({len(self._bypassed_coins)}): "
+                + ", ".join(self._bypassed_coins.keys())
             )
-            # RSI esigi onerisi
-            if best_rsi < 30:
-                self.recommendations["rsi_oversold"] = best_rsi + 5
-                self.lessons.append(f"ONERI: RSI esigini {best_rsi+5}'e dusur — daha kaliteli sinyal")
-            elif best_rsi > 35:
-                self.recommendations["rsi_oversold"] = best_rsi
-                self.lessons.append(f"ONERI: RSI esigini {best_rsi}'e cikar — daha fazla firsat")
+        if self._bad_hours:
+            self.lessons.append(f"Kotu saatler: {sorted(self._bad_hours)}")
 
-        # 2. En karli coinler
-        profitable_coins = []
-        losing_coins = []
-        for sym, perf in self.symbol_performance.items():
-            if perf["trades"] >= 3:
-                wr = perf["wins"] / perf["trades"] if perf["trades"] > 0 else 0
-                if wr >= 0.6:
-                    profitable_coins.append((sym, wr, perf["total_pnl"]))
-                elif wr < 0.4:
-                    losing_coins.append((sym, wr, perf["total_pnl"]))
+        profitable = [(s, p) for s, p in self.symbol_performance.items()
+                      if p["wins"] + p["losses"] >= MIN_TRADES_FOR_DECISION
+                      and p["wins"] / (p["wins"] + p["losses"]) >= 0.60]
+        if profitable:
+            best_str = ", ".join(
+                f"{s}(%{p['wins']/(p['wins']+p['losses'])*100:.0f})" for s, p in
+                sorted(profitable, key=lambda x: x[1]["wins"]/(x[1]["wins"]+x[1]["losses"]), reverse=True)[:5]
+            )
+            self.lessons.append(f"Karli coinler: {best_str}")
 
-        if profitable_coins:
-            coins_str = ", ".join(f"{s} (%{w*100:.0f})" for s, w, _ in profitable_coins)
-            self.lessons.append(f"Karli coinler: {coins_str}")
+        macd_w = self.macd_accuracy["with_macd"]
+        macd_wo = self.macd_accuracy["without_macd"]
+        if macd_w["total"] >= 5 and macd_wo["total"] >= 3:
+            wr_w  = macd_w["wins"] / macd_w["total"]
+            wr_wo = macd_wo["wins"] / macd_wo["total"]
+            self.lessons.append(
+                f"MACD onayli: %{wr_w*100:.0f} win | MACD'siz: %{wr_wo*100:.0f} win"
+            )
+            self.recommendations["require_macd"] = wr_w > wr_wo
 
-        if losing_coins:
-            coins_str = ", ".join(f"{s} (%{w*100:.0f})" for s, w, _ in losing_coins)
-            self.lessons.append(f"Zarari coinler: {coins_str} — azalt veya cikar")
-            self.recommendations["avoid_symbols"] = [s for s, _, _ in losing_coins]
+        if changed:
+            print(f"[LEARNER] {len(changed)} karar uygulandi:")
+            for c in changed:
+                print(f"  → {c}")
 
-        # 3. MACD etkinligi
-        with_macd = self.macd_accuracy["with_macd"]
-        without_macd = self.macd_accuracy["without_macd"]
+    # ─────────────────────────────────────────────────────────────────────
+    def should_trade(self, symbol: str) -> bool:
+        """
+        Bu coine islem yapilmali mi?
 
-        if with_macd["total"] >= 3 and without_macd["total"] >= 3:
-            wr_with = with_macd["wins"] / with_macd["total"]
-            wr_without = without_macd["wins"] / without_macd["total"]
-
-            if wr_with > wr_without + 0.1:
-                self.lessons.append(
-                    f"MACD onayli islemler daha basarili: "
-                    f"%{wr_with*100:.0f} vs %{wr_without*100:.0f}"
-                )
-                self.recommendations["require_macd"] = True
-            elif wr_without > wr_with + 0.1:
-                self.lessons.append(
-                    f"MACD onayi OLUMSUZ etki yapiyor: "
-                    f"%{wr_with*100:.0f} vs %{wr_without*100:.0f}"
-                )
-                self.recommendations["require_macd"] = False
-
-        # 4. En iyi saatler
-        best_hours = []
-        worst_hours = []
-        for hour, perf in self.hour_performance.items():
+        False donerse:
+          - Yeterli veri var VE win rate esigin altinda (bypass)
+          - Simdi kotu saat (yeni pozisyon acma)
+        """
+        # Coin bypass kontrolu
+        if symbol in self._bypassed_coins:
+            perf = self.symbol_performance[symbol]
             total = perf["wins"] + perf["losses"]
-            if total >= 2:
-                wr = perf["wins"] / total
-                if wr >= 0.7:
-                    best_hours.append((hour, wr))
-                elif wr <= 0.3:
-                    worst_hours.append((hour, wr))
+            wr = perf["wins"] / total if total > 0 else 0
+            print(f"  [{symbol}] BYPASS: {self._bypassed_coins[symbol]} — atliyor")
+            return False
 
-        if best_hours:
-            hours_str = ", ".join(f"{h}:00 (%{w*100:.0f})" for h, w in best_hours)
-            self.lessons.append(f"En iyi saatler: {hours_str}")
+        # Kotu saat kontrolu
+        current_hour = datetime.now().hour
+        if current_hour in self._bad_hours:
+            print(f"  [{symbol}] KOTU SAAT ({current_hour}:00) — yeni pozisyon yok")
+            return False
 
-        if worst_hours:
-            hours_str = ", ".join(f"{h}:00 (%{w*100:.0f})" for h, w in worst_hours)
-            self.lessons.append(f"Kotu saatler: {hours_str} — bu saatlerde dikkatli ol")
+        return True
 
-        # 5. STRONG vs NORMAL sinyal karsilastirmasi
-        strong = self.signal_type_performance.get("STRONG_BUY", {"wins": 0, "losses": 0})
-        normal = self.signal_type_performance.get("BUY", {"wins": 0, "losses": 0})
-        s_total = strong["wins"] + strong["losses"]
-        n_total = normal["wins"] + normal["losses"]
+    def get_bypassed_coins(self) -> Dict[str, str]:
+        """Simdi bypass'ta olan coinler."""
+        return dict(self._bypassed_coins)
 
-        if s_total >= 2 and n_total >= 2:
-            s_wr = strong["wins"] / s_total
-            n_wr = normal["wins"] / n_total
-            self.lessons.append(
-                f"STRONG_BUY kazanma: %{s_wr*100:.0f} vs Normal BUY: %{n_wr*100:.0f}"
-            )
-
-        if self.lessons:
-            print(f"[LEARNER] {len(self.lessons)} ders ogrendi:")
-            for l in self.lessons:
-                print(f"  → {l}")
+    def get_bad_hours(self) -> List[int]:
+        """Simdi kotu saat listesi."""
+        return sorted(self._bad_hours)
 
     def get_recommendations(self) -> Dict:
-        """Mevcut oneriler."""
+        """API endpoint icin tam durum."""
+        sym_data = {}
+        for sym, perf in self.symbol_performance.items():
+            total = perf["wins"] + perf["losses"]
+            sym_data[sym] = {
+                **perf,
+                "total": total,
+                "win_rate": round(perf["wins"] / total * 100, 1) if total > 0 else 0,
+                "bypassed": sym in self._bypassed_coins,
+            }
+
         return {
+            "total_analyzed": sum(1 for t in self.trades if t.get("action") == "SELL"),
             "lessons": self.lessons,
             "recommendations": self.recommendations,
+            "auto_decisions": {
+                "bypassed_coins": self._bypassed_coins,
+                "bad_hours":      self._bad_hours,
+                "applied_rsi":    self._applied_rsi_oversold,
+            },
             "data": {
-                "rsi_performance": dict(self.rsi_performance),
-                "symbol_performance": dict(self.symbol_performance),
-                "macd_accuracy": self.macd_accuracy,
-                "total_trades_analyzed": len(self.trades),
-            }
+                "rsi_performance":    dict(self.rsi_performance),
+                "symbol_performance": sym_data,
+                "macd_performance":   self.macd_accuracy,
+                "hour_performance":   dict(self.hour_performance),
+            },
         }
-
-    def should_trade(self, symbol: str) -> bool:
-        """Bu coine islem yapilmali mi? (ogrenme bazli)"""
-        avoid = self.recommendations.get("avoid_symbols", [])
-        if symbol in avoid:
-            logger.info(f"[LEARNER] {symbol} kacinilacak listede — islem yapma")
-            return False
-        return True
